@@ -2,13 +2,13 @@
 
 ## Status
 
-Proposed
+Accepted
 
 | Field | Value |
 | --- | --- |
 | Date proposed | 2026-10-08 |
-| Date decided | — |
-| Decided by | — |
+| Date decided | 2026-10-08 |
+| Decided by | @eliangilsierra (owner, via PR #2) |
 | Related Issue | [#1](https://github.com/eliangilsierra/openhands-mobile-gateway/issues/1) |
 | Supersedes | None |
 | Related ADRs | ADR-0001 (topology and boundary B2), ADR-0004 (no public surface), ADR-0006 (WebSocket auth) |

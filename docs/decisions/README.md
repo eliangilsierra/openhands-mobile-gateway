@@ -8,13 +8,13 @@ the way it is.
 
 | ADR | Title | Status | Date proposed |
 | --- | --- | --- | --- |
-| [ADR-0001](ADR-0001-thin-sibling-gateway-over-openhands-http-api.md) | Build the Mobile Gateway as a thin sibling container that drives OpenHands over its HTTP/WebSocket API | Proposed | 2026-10-08 |
-| [ADR-0002](ADR-0002-typescript-node-runtime.md) | Implement the Gateway in TypeScript on Node.js, with grammY and the official OpenHands TypeScript client | Proposed | 2026-10-08 |
-| [ADR-0003](ADR-0003-sqlite-for-gateway-state.md) | Persist all Gateway state in a single SQLite file on a Docker volume | Proposed | 2026-10-08 |
-| [ADR-0004](ADR-0004-telegram-long-polling.md) | Receive Telegram updates by long polling, not by webhook | Proposed | 2026-10-08 |
-| [ADR-0005](ADR-0005-project-conversation-mapping.md) | Own the project registry in the Gateway and bind one active conversation per (chat, project) | Proposed | 2026-10-08 |
-| [ADR-0006](ADR-0006-event-stream-and-recovery.md) | Consume OpenHands events over the agent-server WebSocket with timestamp replay and client-side deduplication by event id | Proposed | 2026-10-08 |
-| [ADR-0007](ADR-0007-agentcanvas-auth-trust-boundary.md) | Always send `X-Session-API-Key` while treating the `agentcanvas` API as an unverified-auth boundary, and accept the #17763 risk | Proposed | 2026-10-08 |
+| [ADR-0001](ADR-0001-thin-sibling-gateway-over-openhands-http-api.md) | Build the Mobile Gateway as a thin sibling container that drives OpenHands over its HTTP/WebSocket API | Accepted | 2026-10-08 |
+| [ADR-0002](ADR-0002-typescript-node-runtime.md) | Implement the Gateway in TypeScript on Node.js, with grammY and the official OpenHands TypeScript client | Accepted | 2026-10-08 |
+| [ADR-0003](ADR-0003-sqlite-for-gateway-state.md) | Persist all Gateway state in a single SQLite file on a Docker volume | Accepted | 2026-10-08 |
+| [ADR-0004](ADR-0004-telegram-long-polling.md) | Receive Telegram updates by long polling, not by webhook | Accepted | 2026-10-08 |
+| [ADR-0005](ADR-0005-project-conversation-mapping.md) | Own the project registry in the Gateway and bind one active conversation per (chat, project) | Accepted | 2026-10-08 |
+| [ADR-0006](ADR-0006-event-stream-and-recovery.md) | Consume OpenHands events over the agent-server WebSocket with timestamp replay and client-side deduplication by event id | Accepted | 2026-10-08 |
+| [ADR-0007](ADR-0007-agentcanvas-auth-trust-boundary.md) | Always send `X-Session-API-Key` while treating the `agentcanvas` API as an unverified-auth boundary, and accept the #17763 risk | Accepted | 2026-10-08 |
 
 Keep this index updated in the same Pull Request that adds or changes an ADR.
 
