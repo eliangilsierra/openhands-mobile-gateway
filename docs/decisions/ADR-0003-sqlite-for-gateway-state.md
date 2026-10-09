@@ -2,13 +2,13 @@
 
 ## Status
 
-Proposed
+Accepted
 
 | Field | Value |
 | --- | --- |
 | Date proposed | 2026-10-08 |
-| Date decided | — |
-| Decided by | — |
+| Date decided | 2026-10-08 |
+| Decided by | @eliangilsierra (owner, via PR #2) |
 | Related Issue | [#1](https://github.com/eliangilsierra/openhands-mobile-gateway/issues/1) |
 | Supersedes | None |
 | Related ADRs | ADR-0001 (topology), ADR-0002 (runtime), ADR-0005 (what is stored), ADR-0006 (event cursor) |
