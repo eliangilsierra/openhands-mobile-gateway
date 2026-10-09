@@ -1,0 +1,66 @@
+services:
+  # Pre-existing service, reconstructed unchanged from architecture §4.1 (AC-12). This task
+  # only adds the `mobile-gateway` block below and the `gateway-state` volume.
+  agentcanvas:
+    image: ghcr.io/openhands/agent-canvas:latest
+    command: ["--public"]
+    restart: unless-stopped
+    expose:
+      - "8000"
+    environment:
+      PORT: "8000"
+      LOCAL_BACKEND_API_KEY: ${LOCAL_BACKEND_API_KEY}
+      OH_SECRET_KEY: ${OH_SECRET_KEY}
+      AGENT_CANVAS_DISABLE_TELEMETRY: "true"
+    volumes:
+      - canvas-state:/home/openhands/.openhands
+      - claude-home:/home/openhands/.claude
+      - npm-cache:/home/openhands/.npm
+      - canvas-projects:/projects
+
+  # Pre-existing service, reconstructed unchanged from architecture §4.1 (AC-12): tunnels the
+  # public hostname to agentcanvas:8000.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: ["tunnel", "run"]
+    restart: unless-stopped
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - agentcanvas
+
+  # New in this task (architecture §14). No `ports:` mapping (NFR-1/AC-13): the Gateway joins
+  # the existing default Compose network and resolves `agentcanvas` by name; no `networks:` key
+  # is added to any service (AC-12).
+  mobile-gateway:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - agentcanvas
+    environment:
+      OPENHANDS_BASE_URL: http://agentcanvas:8000
+      OPENHANDS_API_KEY: ${SERVICE_PASSWORD_64_CANVASKEY}   # same value as LOCAL_BACKEND_API_KEY
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS}
+      PROJECTS_ROOT: /projects
+      # PROJECTS: toneprofiler,code-sentinel   # optional static override, see ADR-0005
+      DATABASE_PATH: /data/gateway.db
+      LOG_LEVEL: info
+      TZ: ${TZ:-UTC}
+    expose:
+      - "8080"            # health only; deliberately NO ports: mapping (NFR-1, AC-13)
+    volumes:
+      - gateway-state:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  canvas-state:
+  claude-home:
+  npm-cache:
+  canvas-projects:
+  gateway-state:
