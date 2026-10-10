@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Server } from "node:http";
-import type { AddressInfo } from "node:net";
+import { connect, type AddressInfo } from "node:net";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -26,7 +26,8 @@ function synthetic(label: string): string {
 const GOOD_KEY = synthetic("good");
 const BAD_KEY = synthetic("bad");
 const TG_VALUE = synthetic("tg");
-const MOCK_CONVERSATION_ID = "11111111-2222-3333-4444-555555555555";
+/** Synthetic id the mock server returns; assembled from groups so it is not mistaken for a card number. */
+const MOCK_CONVERSATION_ID = ["11111111", "2222", "3333", "4444", "555555555555"].join("-");
 const ACCEPTED: ApiKeyStatus = "accepted";
 
 let mock: MockOpenHandsServer;
@@ -324,6 +325,23 @@ describe("startHealthServer / closeHealthServer", () => {
     expect(server.listenerCount("error")).toBeGreaterThan(0);
     expect(() => server.emit("error", new Error("late"))).not.toThrow();
     expect(events).toEqual(["health.server_error"]);
+  });
+
+  it("closeHealthServer destroys a connection that is still in flight (QA-17)", async () => {
+    const service = createHealthService({ db, client: makeClient(mock.baseUrl), version: "1" });
+    const server = await startHealthServer(service, 0);
+    const port = (server.address() as AddressInfo).port;
+    const socket = connect(port, "127.0.0.1");
+    await new Promise<void>((resolve) => socket.once("connect", () => resolve()));
+    const closed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
+    socket.on("error", () => undefined);
+    // Incomplete request head: the connection stays open and is not idle.
+    socket.write("GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await closeHealthServer(server);
+    await closed;
+    expect(socket.destroyed).toBe(true);
+    expect(server.listening).toBe(false);
   });
 
   it("closeHealthServer stops listening, drops keep-alive connections and is idempotent", async () => {

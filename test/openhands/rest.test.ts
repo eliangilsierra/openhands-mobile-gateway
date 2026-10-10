@@ -279,6 +279,21 @@ describe("timeouts and transport failures", () => {
     expect(server.requests).toHaveLength(2);
   });
 
+  it("a caller signal aborts a hanging read quickly, without retry or backoff sleep (QA-15, QA-16)", async () => {
+    server.addRule({ method: "GET", path: "/server_info", hang: true });
+    const controller = new AbortController();
+    const started = Date.now();
+    const pending = makeClient({ requestTimeoutMs: 60_000 })
+      .getServerInfo(controller.signal)
+      .catch((e: unknown) => e);
+    setTimeout(() => controller.abort(), 50);
+    const error = await pending;
+    expect(error).toBeInstanceOf(UnavailableError);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(sleep).not.toHaveBeenCalled();
+    expect(server.requests).toHaveLength(1);
+  });
+
   it("maps a refused connection to UnavailableError", async () => {
     const client = createOpenHandsRestClient({
       baseUrl: "http://127.0.0.1:1",
