@@ -8,10 +8,10 @@ services:
     expose:
       - "8000"
     environment:
-      PORT: "8000"
-      LOCAL_BACKEND_API_KEY: ${LOCAL_BACKEND_API_KEY}
-      OH_SECRET_KEY: ${OH_SECRET_KEY}
-      AGENT_CANVAS_DISABLE_TELEMETRY: "true"
+      - PORT=8000
+      - LOCAL_BACKEND_API_KEY=${SERVICE_PASSWORD_64_CANVASKEY}
+      - OH_SECRET_KEY=${SERVICE_PASSWORD_64_OHSECRET}
+      - AGENT_CANVAS_DISABLE_TELEMETRY=true
     volumes:
       - canvas-state:/home/openhands/.openhands
       - claude-home:/home/openhands/.claude
@@ -22,10 +22,10 @@ services:
   # public hostname to agentcanvas:8000.
   cloudflared:
     image: cloudflare/cloudflared:latest
-    command: ["tunnel", "run"]
+    command: tunnel --no-autoupdate run
     restart: unless-stopped
     environment:
-      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:?define el token del túnel}
     depends_on:
       - agentcanvas
 
