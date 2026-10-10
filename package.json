@@ -17,7 +17,6 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@openhands/typescript-client": "1.49.6",
     "zod": "^4.6.5"
   },
   "devDependencies": {

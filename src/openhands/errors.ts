@@ -58,15 +58,23 @@ export class UnavailableError extends OpenHandsError {
     const detail = context.status === undefined ? "no response" : `status ${context.status}`;
     super(`OpenHands unavailable: ${detail} (${context.method} ${context.route})`, context, options);
     this.name = "UnavailableError";
+    this.outcomeUnknown = context.method !== "GET" && context.status === undefined;
   }
+
+  /**
+   * True for a non-GET request that failed without any response (timeout, reset): the server
+   * may or may not have applied it, so callers must not assume it was not executed.
+   */
+  readonly outcomeUnknown: boolean;
 }
 
 /** Any other non-2xx status that has no dedicated mapping. */
 export class UnexpectedResponseError extends OpenHandsError {
-  constructor(context: OpenHandsErrorContext) {
+  constructor(context: OpenHandsErrorContext, options?: { cause?: unknown }) {
     super(
       `Unexpected OpenHands response ${String(context.status)} (${context.method} ${context.route})`,
       context,
+      options,
     );
     this.name = "UnexpectedResponseError";
   }

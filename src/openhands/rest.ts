@@ -1,4 +1,3 @@
-import { HttpClient, HttpError } from "@openhands/typescript-client/client/http-client";
 import type { Logger } from "../logger.js";
 import {
   AuthError,
@@ -44,17 +43,21 @@ import type {
  * 13. GET  /api/file/search_subdirs
  * 14. GET  /api/workspaces
  *
- * Authentication: `X-Session-API-Key` is set once by the wrapped `HttpClient` and therefore
- * rides on every request, including each retry (ADR-0007 decision 1).
+ * Authentication: `X-Session-API-Key` is built in exactly one place (`attempt`) and therefore
+ * rides on every request, including each retry (ADR-0007 decision 1). Redirects are never
+ * followed (`redirect: "manual"`), and any 3xx is an UnexpectedResponseError.
  *
  * Error mapping (§7.2): 401 -> AuthError; 404 on a conversation call -> NotFoundError; 409 on
- * `/run` -> ConflictError; 502/503/504, timeouts and refused connections -> UnavailableError.
- * Only GET calls are retried (with exponential backoff); POSTs never are, in particular
- * `POST .../events`, which would duplicate a task.
+ * `/run` -> ConflictError; 502/503/504, timeouts and refused connections -> UnavailableError;
+ * other non-2xx and malformed 2xx JSON -> UnexpectedResponseError (never retried).
+ * Only GET calls are retried (exponential backoff with jitter); POSTs never are, in
+ * particular `POST .../events`, which would duplicate a task. A POST that fails without a
+ * response has `outcomeUnknown === true`: the server may have processed it.
  *
- * Timeouts: the wrapped client offers a single per-request timeout (fetch, no separate
- * connect phase), so `requestTimeoutMs` (30 s read) bounds the whole request; a hung connect
- * ends in the same UnavailableError. See the PR description for this documented deviation.
+ * Timeouts: one per-request timeout (`requestTimeoutMs`, 30 s) bounds the whole request;
+ * there is no separate connect timeout (accepted deviation, see the PR). The package
+ * `@openhands/typescript-client` exposes no way to disable redirects, so the transport is a
+ * thin `fetch` wrapper here (the fallback ADR-0002 names).
  */
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -68,6 +71,8 @@ export interface RetryOptions {
   readonly baseDelayMs?: number;
   /** Injectable for tests. */
   readonly sleep?: (ms: number) => Promise<void>;
+  /** Jitter source in [0, 1); injectable for tests. */
+  readonly random?: () => number;
 }
 
 export interface OpenHandsRestClientOptions {
@@ -111,11 +116,28 @@ interface CallSpec {
 
 const UNAVAILABLE_STATUSES: ReadonlySet<number> = new Set([502, 503, 504]);
 
+/** SR-1: UUID / hex-dash style ids only; rejects `.`, `..`, slashes, encodings and whitespace. */
+const CONVERSATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
+
 function pathId(id: string): string {
-  if (id.trim().length === 0) {
-    throw new TypeError("conversation id must not be empty");
+  if (!CONVERSATION_ID_PATTERN.test(id)) {
+    throw new TypeError("conversation id has an invalid format");
   }
-  return encodeURIComponent(id);
+  return id;
+}
+
+/** SR-3: only http/https base URLs; returned without a trailing slash. */
+function parseBaseUrl(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch (error) {
+    throw new TypeError("OPENHANDS_BASE_URL must be a valid URL", { cause: error });
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new TypeError("OPENHANDS_BASE_URL must use http or https");
+  }
+  return url.href.replace(/\/+$/, "");
 }
 
 function mapHttpStatus(status: number, spec: CallSpec): OpenHandsError {
@@ -155,25 +177,52 @@ export function createOpenHandsRestClient(options: OpenHandsRestClientOptions): 
       }));
   const logger = options.logger;
 
-  const http = new HttpClient({ baseUrl: options.baseUrl, apiKey: options.apiKey, timeout });
+  const base = parseBaseUrl(options.baseUrl);
+  const apiKey = options.apiKey;
+  const random = options.retry?.random ?? Math.random;
 
   async function attempt<T>(spec: CallSpec): Promise<T> {
     const context: OpenHandsErrorContext = { method: spec.method, route: spec.route };
+    const url = new URL(base + spec.path);
+    for (const [key, value] of Object.entries(spec.params ?? {})) {
+      url.searchParams.append(key, String(value));
+    }
+    const headers: Record<string, string> = { "X-Session-API-Key": apiKey };
+    if (spec.method === "POST") {
+      headers["Content-Type"] = "application/json";
+    }
+
+    let response: Response;
+    let text: string;
     try {
-      const requestOptions = { timeout, ...(spec.params ? { params: spec.params } : {}) };
-      const response =
-        spec.method === "GET"
-          ? await http.get<T>(spec.path, requestOptions)
-          : await http.post<T>(spec.path, spec.body, requestOptions);
-      return response.data;
+      response = await fetch(url, {
+        method: spec.method,
+        headers,
+        // SR-2: never follow a redirect, so the key cannot be replayed to another origin.
+        redirect: "manual",
+        signal: AbortSignal.timeout(timeout),
+        ...(spec.method === "POST" && spec.body !== undefined ? { body: JSON.stringify(spec.body) } : {}),
+      });
+      text = await response.text();
     } catch (error) {
-      if (error instanceof HttpError) {
-        // Deliberately dropped: the HttpError message embeds the response body.
-        throw mapHttpStatus(error.status, spec);
-      }
       // Timeout or connection failure: no HTTP status. The cause is a fetch/abort error and
       // never contains request headers.
       throw new UnavailableError(context, { cause: error });
+    }
+
+    // Any non-2xx (including every 3xx) is mapped from the status alone; the body is dropped
+    // so it cannot carry the key into an error or log line.
+    if (response.status < 200 || response.status > 299) {
+      throw mapHttpStatus(response.status, spec);
+    }
+    if (text.length === 0) {
+      return undefined as T;
+    }
+    try {
+      return JSON.parse(text) as T;
+    } catch (error) {
+      // CR-1: a malformed 2xx body is a protocol problem, not an outage; never retried.
+      throw new UnexpectedResponseError({ ...context, status: response.status }, { cause: error });
     }
   }
 
@@ -195,10 +244,11 @@ export function createOpenHandsRestClient(options: OpenHandsRestClientOptions): 
         }
         logger?.warn("OpenHands read failed, retrying", {
           event: "openhands.retry",
-          status: error.status ?? 0,
+          ...(error.status !== undefined ? { status: error.status } : {}),
           err_type: error.name,
         });
-        await sleep(baseDelayMs * 2 ** (n - 1));
+        // SR-4: up to +20% jitter so concurrent readers do not retry in lockstep.
+        await sleep(Math.round(baseDelayMs * 2 ** (n - 1) * (1 + 0.2 * random())));
       }
     }
   }

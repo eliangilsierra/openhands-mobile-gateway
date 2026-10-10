@@ -27,6 +27,10 @@ export interface MockRule {
   times?: number;
   /** Optional body for the forced response. */
   readonly body?: unknown;
+  /** Sent verbatim instead of `body` (e.g. malformed JSON). */
+  readonly raw?: string;
+  /** Extra response headers (e.g. `location` for a redirect). */
+  readonly headers?: Readonly<Record<string, string>>;
 }
 
 export interface MockOpenHandsServer {
@@ -137,7 +141,13 @@ export async function startMockOpenHandsServer(expectedKey: string): Promise<Moc
         if (rule.hang === true) {
           return;
         }
-        sendJson(res, rule.status ?? 500, rule.body ?? { detail: "forced" });
+        if (rule.raw !== undefined) {
+          res.writeHead(rule.status ?? 200, { "content-type": "application/json", ...rule.headers });
+          res.end(rule.raw);
+          return;
+        }
+        res.writeHead(rule.status ?? 500, { "content-type": "application/json", ...rule.headers });
+        res.end(JSON.stringify(rule.body ?? { detail: "forced" }));
         return;
       }
 

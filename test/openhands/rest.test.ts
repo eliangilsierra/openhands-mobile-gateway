@@ -27,7 +27,7 @@ function makeClient(overrides: { requestTimeoutMs?: number; key?: string; lines?
     baseUrl: server.baseUrl,
     apiKey: overrides.key ?? KEY,
     ...(overrides.requestTimeoutMs !== undefined ? { requestTimeoutMs: overrides.requestTimeoutMs } : {}),
-    retry: { maxAttempts: 3, baseDelayMs: 100, sleep },
+    retry: { maxAttempts: 3, baseDelayMs: 100, sleep, random: () => 0 },
     ...(logger ? { logger } : {}),
   });
 }
@@ -145,11 +145,6 @@ describe("success shapes and T-AC-1 (header on every call)", () => {
     expect((await client.createConversation({ workspace: { working_dir: "/p" } })).id).toBeTruthy();
     expect(await client.countConversations()).toBe(3);
     expect((await client.getConversation(CID)).execution_status).toBe("running");
-  });
-
-  it("encodes the conversation id in the path", async () => {
-    await makeClient().getConversation("a/b c");
-    expect(server.requests[0]?.path).toBe("/api/conversations/a%2Fb%20c");
   });
 
   it("keeps the header on every retry", async () => {
@@ -292,6 +287,131 @@ describe("timeouts and transport failures", () => {
   });
 });
 
+describe("CR-1: malformed 2xx JSON", () => {
+  it("POST .../events -> UnexpectedResponseError, not retried, not Unavailable", async () => {
+    server.addRule({ method: "POST", path: `/api/conversations/${CID}/events`, status: 200, raw: "{not json" });
+    const error = await makeClient()
+      .sendEvent(CID, { role: "user", content: "x", run: true })
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(UnexpectedResponseError);
+    expect(error).not.toBeInstanceOf(UnavailableError);
+    expect((error as UnexpectedResponseError).status).toBe(200);
+    expect(server.requests).toHaveLength(1);
+  });
+
+  it("GET -> UnexpectedResponseError and is not retried", async () => {
+    server.addRule({ method: "GET", path: "/api/workspaces", status: 200, raw: "<html>oops" });
+    await expect(makeClient().listWorkspaces()).rejects.toBeInstanceOf(UnexpectedResponseError);
+    expect(server.requests).toHaveLength(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+});
+
+describe("SR-1: conversation id allow-list", () => {
+  it.each([".", "..", "../x", "a/b", "a%2Fb", "a b", "a?b=1", "a#b", "-lead", "x".repeat(65), "id\n", ""])(
+    "rejects %j before any request",
+    async (id) => {
+      const client = makeClient();
+      await expect(client.getConversation(id)).rejects.toThrow(TypeError);
+      await expect(client.runConversation(id)).rejects.toThrow(TypeError);
+      await expect(client.searchEvents(id)).rejects.toThrow(TypeError);
+      expect(server.requests).toHaveLength(0);
+    },
+  );
+
+  it("accepts a UUID and a hex id", async () => {
+    const client = makeClient();
+    await client.getConversation("c0ffee00-0000-4000-8000-000000000001");
+    await client.getConversation("deadbeef");
+    expect(server.requests).toHaveLength(2);
+  });
+});
+
+describe("SR-2: redirects are never followed", () => {
+  it.each([301, 302, 307, 308])("%i -> UnexpectedResponseError and the key never reaches the target", async (status) => {
+    const target = await startMockOpenHandsServer("irrelevant");
+    try {
+      server.addRule({
+        method: "GET",
+        path: `/api/conversations/${CID}`,
+        status,
+        headers: { location: `${target.baseUrl}/api/conversations/${CID}` },
+      });
+      await expect(makeClient().getConversation(CID)).rejects.toBeInstanceOf(UnexpectedResponseError);
+      expect(target.requests).toHaveLength(0);
+      expect(server.requests).toHaveLength(1);
+    } finally {
+      await target.close();
+    }
+  });
+
+  it("does not follow a redirect on a POST either", async () => {
+    const target = await startMockOpenHandsServer("irrelevant");
+    try {
+      server.addRule({
+        method: "POST",
+        path: `/api/conversations/${CID}/events`,
+        status: 307,
+        headers: { location: `${target.baseUrl}/steal` },
+      });
+      await expect(makeClient().sendEvent(CID, { role: "user", content: "x", run: true })).rejects.toBeInstanceOf(
+        UnexpectedResponseError,
+      );
+      expect(target.requests).toHaveLength(0);
+    } finally {
+      await target.close();
+    }
+  });
+});
+
+describe("SR-3: base URL scheme", () => {
+  it.each(["file:///etc/passwd", "ftp://host/", "javascript:alert(1)", "not a url", "  "])(
+    "refuses %j",
+    (baseUrl) => {
+      expect(() => createOpenHandsRestClient({ baseUrl, apiKey: KEY })).toThrow(TypeError);
+    },
+  );
+
+  it("accepts http and https", () => {
+    expect(() => createOpenHandsRestClient({ baseUrl: "http://agentcanvas:8000/", apiKey: KEY })).not.toThrow();
+    expect(() => createOpenHandsRestClient({ baseUrl: "https://agentcanvas.example", apiKey: KEY })).not.toThrow();
+  });
+});
+
+describe("CR-3, CR-4, SR-4: outcome flag, retry log, jitter", () => {
+  it("flags a timed-out POST as outcomeUnknown but not a timed-out GET or a 502 POST", async () => {
+    server.addRule({ method: "POST", path: `/api/conversations/${CID}/events`, hang: true, times: 1 });
+    const post = await makeClient({ requestTimeoutMs: 100 })
+      .sendEvent(CID, { role: "user", content: "x", run: true })
+      .catch((e: unknown) => e);
+    expect((post as UnavailableError).outcomeUnknown).toBe(true);
+
+    server.addRule({ method: "POST", path: `/api/conversations/${CID}/pause`, status: 502 });
+    const bad = await makeClient().pauseConversation(CID).catch((e: unknown) => e);
+    expect((bad as UnavailableError).outcomeUnknown).toBe(false);
+  });
+
+  it("logs the retry without a bogus status when there was no response", async () => {
+    const lines: string[] = [];
+    server.addRule({ method: "GET", path: "/api/workspaces", hang: true, times: 1 });
+    await makeClient({ requestTimeoutMs: 100, lines }).listWorkspaces();
+    const retry = lines.map((l) => JSON.parse(l) as Record<string, unknown>).find((r) => r.event === "openhands.retry");
+    expect(retry).toBeDefined();
+    expect(retry).not.toHaveProperty("status");
+  });
+
+  it("adds up to 20% jitter to the backoff", async () => {
+    server.addRule({ method: "GET", path: "/api/workspaces", status: 502, times: 2 });
+    const client = createOpenHandsRestClient({
+      baseUrl: server.baseUrl,
+      apiKey: KEY,
+      retry: { maxAttempts: 3, baseDelayMs: 100, sleep, random: () => 0.5 },
+    });
+    await client.listWorkspaces();
+    expect(sleep.mock.calls.map((c) => c[0])).toEqual([110, 220]);
+  });
+});
+
 describe("T-AC-5: all HTTP access lives in src/openhands/rest.ts", () => {
   function listSources(dir: string): string[] {
     return readdirSync(dir).flatMap((entry) => {
@@ -324,11 +444,10 @@ describe("T-AC-5: all HTTP access lives in src/openhands/rest.ts", () => {
     expect(offenders).toEqual([]);
   });
 
-  it("rest.ts never imports the LLM subpaths or the unrestricted package root", () => {
+  it("rest.ts never imports the LLM subpaths or the package root (T-B4-2)", () => {
     const text = readFileSync(restFile, "utf-8");
+    expect(text).not.toMatch(/from\s+["']@openhands\/typescript-client/);
     expect(text).not.toMatch(/typescript-client\/llm/);
-    expect(text).toMatch(/from "@openhands\/typescript-client\/client\/http-client"/);
-    expect(text).not.toMatch(/from "@openhands\/typescript-client"/);
   });
 
   it("rest.ts reaches none of the deliberately-not-called routes", () => {
