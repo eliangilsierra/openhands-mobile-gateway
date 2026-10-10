@@ -18,6 +18,9 @@ export interface CreateBotOptions {
   readonly chatState: ChatStateStore;
   readonly logger: Logger;
   readonly allowlistSalt?: string;
+  readonly rejectionWindowMs?: number;
+  readonly maxTrackedSenders?: number;
+  readonly now?: () => number;
 }
 
 /**
@@ -31,6 +34,9 @@ export function createBot(options: CreateBotOptions): Bot<Context> {
       allowedUserIds: options.allowedUserIds,
       logger: options.logger,
       ...(options.allowlistSalt !== undefined ? { salt: options.allowlistSalt } : {}),
+      ...(options.rejectionWindowMs !== undefined ? { rejectionWindowMs: options.rejectionWindowMs } : {}),
+      ...(options.maxTrackedSenders !== undefined ? { maxTrackedSenders: options.maxTrackedSenders } : {}),
+      ...(options.now !== undefined ? { now: options.now } : {}),
     }),
   );
   registerStart(bot, options.chatState);
@@ -44,6 +50,24 @@ export interface PollerOptions {
   readonly status: TelegramStatus;
   readonly sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
   readonly random?: () => number;
+}
+
+const MAX_LOGGED_MESSAGE_LENGTH = 160;
+
+/**
+ * Bounded, sanitised error text for logs: bot-token-shaped strings and control characters are
+ * removed and the length is capped, so an arbitrary handler or transport error cannot leak a
+ * secret or flood a log line (SEC-LOW-2).
+ */
+export function sanitizeErrorMessage(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const cleaned = Array.from(raw.replace(/\d{6,}:[A-Za-z0-9_-]{10,}/g, "<token>"), (ch) => {
+    const code = ch.charCodeAt(0);
+    return code < 0x20 || code === 0x7f ? " " : ch;
+  }).join("");
+  return cleaned.length > MAX_LOGGED_MESSAGE_LENGTH
+    ? `${cleaned.slice(0, MAX_LOGGED_MESSAGE_LENGTH)}...`
+    : cleaned;
 }
 
 function defaultSleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -81,8 +105,11 @@ export class TelegramPoller {
   private readonly status: TelegramStatus;
   private readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
   private readonly random: () => number;
+  // In-memory only: a restart forgets it and Telegram may replay the last batch, so later
+  // task-creating commands must be idempotent on their own (architecture §7.1).
   private lastProcessedUpdateId: number | null = null;
   private failures = 0;
+  private degraded = false;
 
   constructor(options: PollerOptions) {
     this.bot = options.bot;
@@ -94,20 +121,27 @@ export class TelegramPoller {
 
   /** Polls until `signal` aborts. Never rejects for Telegram or handler errors. */
   async run(signal: AbortSignal): Promise<void> {
+    // grammY types its `signal` parameter with the `abort-controller` package's AbortSignal, which
+    // is structurally incompatible with the Node global one although it is used the same way.
+    const apiSignal = signal as unknown as Parameters<Bot<Context>["init"]>[0];
     while (!signal.aborted) {
       try {
-        await this.bot.init();
+        await this.bot.init(apiSignal);
         const offset = this.lastProcessedUpdateId === null ? undefined : this.lastProcessedUpdateId + 1;
-        // The in-flight long poll ends on its own within POLL_TIMEOUT_SECONDS after an abort.
-        const updates = await this.bot.api.getUpdates({
-          timeout: POLL_TIMEOUT_SECONDS,
-          limit: POLL_LIMIT,
-          allowed_updates: [...ALLOWED_UPDATES],
-          ...(offset !== undefined ? { offset } : {}),
-        });
-        this.failures = 0;
-        this.status.set("connected");
+        const updates = await this.bot.api.getUpdates(
+          {
+            timeout: POLL_TIMEOUT_SECONDS,
+            limit: POLL_LIMIT,
+            allowed_updates: [...ALLOWED_UPDATES],
+            ...(offset !== undefined ? { offset } : {}),
+          },
+          apiSignal,
+        );
+        this.markHealthy();
         for (const update of updates) {
+          if (signal.aborted) {
+            break;
+          }
           await this.handle(update);
         }
       } catch (error) {
@@ -131,18 +165,29 @@ export class TelegramPoller {
       this.logger.error("Update handler failed", {
         event: "telegram.update.failed",
         err_type: error instanceof Error ? error.name : typeof error,
-        err_msg: error instanceof Error ? error.message : String(error),
+        err_msg: sanitizeErrorMessage(error),
       });
     }
     this.lastProcessedUpdateId = update.update_id;
   }
 
-  private async recover(error: unknown, signal: AbortSignal): Promise<void> {
-    this.status.set("disconnected");
-    const errType = error instanceof Error ? error.name : typeof error;
-    const errMsg = error instanceof Error ? error.message : String(error);
+  private markHealthy(): void {
+    this.failures = 0;
+    this.status.set("connected");
+    if (this.degraded) {
+      this.degraded = false;
+      this.logger.info("Telegram polling recovered", { event: "telegram.poll.recovered" });
+    }
+  }
 
-    if (error instanceof GrammyError && error.error_code === 429) {
+  private async recover(error: unknown, signal: AbortSignal): Promise<void> {
+    this.degraded = true;
+    const errType = error instanceof Error ? error.name : typeof error;
+    const errMsg = sanitizeErrorMessage(error);
+    const code = error instanceof GrammyError ? error.error_code : undefined;
+
+    if (code === 429 && error instanceof GrammyError) {
+      this.status.set("disconnected");
       const retryAfter = error.parameters.retry_after ?? 1;
       this.logger.warn("Telegram rate limit on getUpdates", {
         event: "telegram.poll.rate_limited",
@@ -153,13 +198,22 @@ export class TelegramPoller {
       return;
     }
 
-    if (error instanceof GrammyError && error.error_code === 409) {
+    if (code === 409) {
+      this.status.set("conflict");
       this.logger.error("getUpdates conflict: another poller or a webhook is active", {
         event: "telegram.poll.conflict",
         err_type: errType,
         err_msg: errMsg,
       });
+    } else if (code === 401 || code === 404) {
+      this.status.set("unauthorized");
+      this.logger.error("Telegram rejected the bot token (revoked or invalid); fix TELEGRAM_BOT_TOKEN", {
+        event: "telegram.poll.unauthorized",
+        err_type: errType,
+        status: code,
+      });
     } else {
+      this.status.set("disconnected");
       this.logger.warn("getUpdates failed, will retry", {
         event: "telegram.poll.error",
         err_type: errType,

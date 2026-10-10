@@ -4,12 +4,19 @@ import {
   ALLOWED_UPDATES,
   backoffDelayMs,
   createBot,
+  sanitizeErrorMessage,
   POLL_LIMIT,
   POLL_TIMEOUT_SECONDS,
   TelegramPoller,
 } from "../../../src/channels/telegram/bot.js";
 import { HELP_TEXT } from "../../../src/channels/telegram/commands/help.js";
-import { hashUserId, UNAUTHORIZED_TEXT } from "../../../src/channels/telegram/middleware/allowlist.js";
+import {
+  hashUserId,
+  RejectionThrottle,
+  UNAUTHORIZED_TEXT,
+} from "../../../src/channels/telegram/middleware/allowlist.js";
+import type {} from "../../../src/channels/telegram/middleware/allowlist.js";
+// from "../../../src/channels/telegram/middleware/allowlist.js";
 import { TelegramStatus } from "../../../src/channels/telegram/status.js";
 import { ChatStateRepository } from "../../../src/store/chat-state.js";
 import { closeStore, openStore } from "../../../src/store/db.js";
@@ -86,14 +93,15 @@ describe("allowlist middleware", () => {
     const { poller, calls } = build();
     const inputs = ["/start", "/help", "/nonexistent", "hello", "/use secret-project"];
     for (const [i, text] of inputs.entries()) {
-      await poller.handle(messageUpdate(i + 1, STRANGER, text));
+      await poller.handle(messageUpdate(i + 1, STRANGER + i, text));
     }
     const texts = sends(calls).map((c) => c.payload["text"]);
     expect(texts).toEqual(inputs.map(() => UNAUTHORIZED_TEXT));
 
     const rejected = logger.records.filter((r) => r.fields?.["event"] === "telegram.update.rejected");
     expect(rejected).toHaveLength(inputs.length);
-    expect(new Set(rejected.map((r) => JSON.stringify(r)))).toHaveProperty("size", 1);
+    // Same message and event for every input; only the (hashed) sender reference differs.
+    expect(new Set(rejected.map((r) => `${r.level}|${r.msg}|${String(r.fields?.["event"])}`))).toHaveProperty("size", 1);
     expect(JSON.stringify(logger.records)).not.toContain("secret-project");
   });
 
@@ -123,6 +131,62 @@ describe("allowlist middleware", () => {
     const { poller } = build(() => ({ ok: false, error_code: 403, description: "Forbidden: bot was blocked" }));
     await expect(poller.handle(messageUpdate(1, STRANGER, "hi"))).resolves.toBeUndefined();
     expect(logger.records.some((r) => r.fields?.["event"] === "telegram.update.reject_reply_failed")).toBe(true);
+  });
+
+  it("SEC-MEDIUM-1: replies at most once per sender per window, then again after it", async () => {
+    let clock = 1_000_000;
+    const bot = createBot({ token: TOKEN, allowedUserIds: new Set([ALLOWED]), chatState, logger, allowlistSalt: SALT, rejectionWindowMs: 60_000, now: () => clock });
+    bot.botInfo = BOT_INFO;
+    const calls = installFakeApi(bot, () => ({ ok: true, result: true }));
+    const poller = new TelegramPoller({ bot, logger, status: new TelegramStatus(), sleep: () => Promise.resolve() });
+
+    for (let i = 1; i <= 5; i += 1) await poller.handle(messageUpdate(i, STRANGER, "spam"));
+    expect(sends(calls)).toHaveLength(1);
+
+    clock += 60_000;
+    await poller.handle(messageUpdate(6, STRANGER, "spam"));
+    expect(sends(calls)).toHaveLength(2);
+    // A different sender is not affected by the first one's window.
+    await poller.handle(messageUpdate(7, STRANGER + 1, "hi"));
+    expect(sends(calls)).toHaveLength(3);
+  });
+
+  it("SEC-MEDIUM-2: logs the first rejection per window and summarises the rest", async () => {
+    let clock = 5_000;
+    const bot = createBot({ token: TOKEN, allowedUserIds: new Set([ALLOWED]), chatState, logger, allowlistSalt: SALT, now: () => clock });
+    bot.botInfo = BOT_INFO;
+    installFakeApi(bot, () => ({ ok: true, result: true }));
+    const poller = new TelegramPoller({ bot, logger, status: new TelegramStatus(), sleep: () => Promise.resolve() });
+
+    for (let i = 1; i <= 5; i += 1) await poller.handle(messageUpdate(i, STRANGER, "spam"));
+    const events = () => logger.records.map((r) => r.fields?.["event"]);
+    expect(events().filter((e) => e === "telegram.update.rejected")).toHaveLength(1);
+    expect(events()).not.toContain("telegram.update.rejected_summary");
+
+    clock += 60_000;
+    await poller.handle(messageUpdate(6, STRANGER, "spam"));
+    const summary = logger.records.find((r) => r.fields?.["event"] === "telegram.update.rejected_summary");
+    expect(summary?.msg).toContain("Suppressed 4");
+    expect(summary?.fields?.["chat_ref"]).toBe(hashUserId(STRANGER, SALT));
+    expect(events().filter((e) => e === "telegram.update.rejected")).toHaveLength(2);
+  });
+
+  it("SEC-MEDIUM-1: stays silent in group chats but still logs once", async () => {
+    const { poller, calls } = build();
+    await poller.handle(messageUpdate(1, STRANGER, "hi", "supergroup"));
+    expect(calls).toHaveLength(0);
+    expect(logger.records.filter((r) => r.fields?.["event"] === "telegram.update.rejected")).toHaveLength(1);
+  });
+
+  it("SEC-MEDIUM-1: tracked senders stay bounded and evicted ones get their summary", () => {
+    const throttle = new RejectionThrottle(logger, 60_000, 5, () => 1_000);
+    expect(throttle.admit("first")).toBe(true);
+    expect(throttle.admit("first")).toBe(false);
+    for (let i = 0; i < 500; i += 1) throttle.admit(`sender-${i}`);
+    expect(throttle.size).toBe(5);
+    const summaries = logger.records.filter((r) => r.fields?.["event"] === "telegram.update.rejected_summary");
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]?.msg).toContain("Suppressed 1");
   });
 
   it("hashes differ per salt and never contain the raw id", () => {
@@ -193,15 +257,21 @@ describe("poller", () => {
   it("T-AC-4: 409 logs ERROR, reports disconnected, retries and never calls deleteWebhook", async () => {
     const ac = new AbortController();
     let polls = 0;
+    const statusDuringConflict: string[] = [];
+    const holder: { status?: TelegramStatus } = {};
     const { poller, calls, status, sleeps } = build((call) => {
       if (call.method !== "getUpdates") return { ok: true, result: true };
       polls += 1;
+      if (polls === 3 && holder.status) statusDuringConflict.push(holder.status.get());
       if (polls <= 2) return { ok: false, error_code: 409, description: "Conflict: terminated by other getUpdates request" };
       ac.abort();
       return { ok: true, result: [] };
     });
+    holder.status = status;
     await poller.run(ac.signal);
 
+    expect(statusDuringConflict).toEqual(["conflict"]);
+    expect(logger.records.some((r) => r.fields?.["event"] === "telegram.poll.recovered")).toBe(true);
     const errors = logger.records.filter((r) => r.level === "error" && r.fields?.["event"] === "telegram.poll.conflict");
     expect(errors).toHaveLength(2);
     expect(calls.some((c) => c.method === "deleteWebhook")).toBe(false);
@@ -209,17 +279,22 @@ describe("poller", () => {
     expect(status.get()).toBe("connected");
   });
 
-  it("409 leaves the status disconnected while the conflict lasts", async () => {
+  it("409 leaves the status at conflict while the conflict lasts", async () => {
     const ac = new AbortController();
+    let polls = 0;
+    const observed: string[] = [];
     const { poller, status } = build((call) => {
-      if (call.method === "getUpdates") {
-        queueMicrotask(() => ac.abort());
-        return { ok: false, error_code: 409, description: "Conflict" };
+      if (call.method !== "getUpdates") return { ok: true, result: true };
+      polls += 1;
+      if (polls === 3) {
+        observed.push(status.get());
+        ac.abort();
+        return { ok: true, result: [] };
       }
-      return { ok: true, result: true };
+      return { ok: false, error_code: 409, description: "Conflict" };
     });
     await poller.run(ac.signal);
-    expect(status.get()).toBe("disconnected");
+    expect(observed).toEqual(["conflict"]);
   });
 
   it("429 honours retry_after", async () => {
@@ -285,6 +360,115 @@ describe("poller", () => {
     await poller.run(ac.signal);
     expect(logger.records.some((r) => r.fields?.["event"] === "telegram.update.failed")).toBe(true);
     expect(calls.filter((c) => c.method === "getUpdates")[1]?.payload["offset"]).toBe(31);
+  });
+
+  it("CR-1: aborting an in-flight long poll ends run() immediately and passes the signal", async () => {
+    const ac = new AbortController();
+    let seenSignal: AbortSignal | undefined;
+    const { poller } = build(async (call) => {
+      if (call.method !== "getUpdates") return { ok: true, result: true };
+      seenSignal = call.signal;
+      await new Promise<void>((_resolve, reject) => {
+        call.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        queueMicrotask(() => ac.abort());
+      });
+      return { ok: true, result: [] };
+    });
+    await poller.run(ac.signal);
+    expect(seenSignal).toBeDefined();
+    expect(ac.signal.aborted).toBe(true);
+  });
+
+  it("CR-1: abort between updates of a batch stops processing the rest", async () => {
+    const ac = new AbortController();
+    const { poller, calls } = build((call) => {
+      if (call.method === "sendMessage") {
+        ac.abort();
+        return { ok: true, result: true };
+      }
+      return { ok: true, result: [messageUpdate(40, ALLOWED, "/help"), messageUpdate(41, ALLOWED, "/help")] };
+    });
+    await poller.run(ac.signal);
+    expect(sends(calls)).toHaveLength(1);
+  });
+
+  it("CR-7: a repeated update_id across polls is processed once", async () => {
+    const ac = new AbortController();
+    let polls = 0;
+    const { poller, calls } = build((call) => {
+      if (call.method !== "getUpdates") return { ok: true, result: true };
+      polls += 1;
+      if (polls === 1) return { ok: true, result: [messageUpdate(50, ALLOWED, "/help")] };
+      if (polls === 2) return { ok: true, result: [messageUpdate(50, ALLOWED, "/help"), messageUpdate(51, ALLOWED, "/help")] };
+      ac.abort();
+      return { ok: true, result: [] };
+    });
+    await poller.run(ac.signal);
+    expect(sends(calls)).toHaveLength(2);
+  });
+
+  it("CR-2: 401 logs a clear ERROR without the token, sets unauthorized and still backs off", async () => {
+    const ac = new AbortController();
+    let polls = 0;
+    const { poller, status, sleeps } = build((call) => {
+      if (call.method !== "getUpdates") return { ok: true, result: true };
+      polls += 1;
+      if (polls <= 2) return { ok: false, error_code: 401, description: "Unauthorized" };
+      ac.abort();
+      return { ok: true, result: [] };
+    });
+    const seen: string[] = [];
+    const observe = status.set.bind(status);
+    status.set = (state) => {
+      seen.push(state);
+      observe(state);
+    };
+    await poller.run(ac.signal);
+
+    const errors = logger.records.filter((r) => r.level === "error" && r.fields?.["event"] === "telegram.poll.unauthorized");
+    expect(errors).toHaveLength(2);
+    expect(errors[0]?.msg).toContain("TELEGRAM_BOT_TOKEN");
+    expect(errors[0]?.fields?.["status"]).toBe(401);
+    expect(logger.records.some((r) => r.fields?.["event"] === "telegram.poll.error")).toBe(false);
+    expect(JSON.stringify(logger.records)).not.toContain(TOKEN);
+    expect(seen.slice(0, 2)).toEqual(["unauthorized", "unauthorized"]);
+    expect(sleeps).toEqual([500, 1000]);
+  });
+
+  it("CR-2: 404 (revoked token) is treated like 401", async () => {
+    const ac = new AbortController();
+    let polls = 0;
+    const observed: string[] = [];
+    const { poller, status } = build((call) => {
+      if (call.method !== "getUpdates") return { ok: true, result: true };
+      polls += 1;
+      if (polls === 2) {
+        observed.push(status.get());
+        ac.abort();
+        return { ok: true, result: [] };
+      }
+      return { ok: false, error_code: 404, description: "Not Found" };
+    });
+    await poller.run(ac.signal);
+    expect(observed).toEqual(["unauthorized"]);
+  });
+
+  it("SEC-LOW-2: handler errors are logged with a bounded, token-free message", async () => {
+    const { bot, poller } = build();
+    bot.command("boom", () => {
+      throw new Error(`${TOKEN} ${"x".repeat(1000)}\nmy-private-text`);
+    });
+    await poller.handle(messageUpdate(60, ALLOWED, "/boom"));
+    const failed = logger.records.find((r) => r.fields?.["event"] === "telegram.update.failed");
+    const msg = String(failed?.fields?.["err_msg"]);
+    expect(msg.length).toBeLessThanOrEqual(165);
+    expect(msg).not.toContain(TOKEN);
+    expect(msg).not.toContain("\n");
+  });
+
+  it("sanitizeErrorMessage handles non-Error values", () => {
+    expect(sanitizeErrorMessage("plain\u0007text")).toBe("plain text");
+    expect(sanitizeErrorMessage(new Error("a".repeat(500))).length).toBe(163);
   });
 
   it("never writes the bot token or message text to the logs", async () => {

@@ -4,6 +4,7 @@ import type { Update } from "grammy/types";
 export interface ApiCall {
   readonly method: string;
   readonly payload: Record<string, unknown>;
+  readonly signal: AbortSignal | undefined;
 }
 
 export type ApiResult = { ok: true; result: unknown } | { ok: false; error_code: number; description: string; parameters?: { retry_after: number } };
@@ -14,8 +15,14 @@ export function installFakeApi(
   respond: (call: ApiCall) => ApiResult | Promise<ApiResult>,
 ): ApiCall[] {
   const calls: ApiCall[] = [];
-  bot.api.config.use(async (_prev, method, payload) => {
-    const call: ApiCall = { method, payload: payload as Record<string, unknown> };
+  bot.api.config.use(async (_prev, method, payload, signal) => {
+    // grammY types the transformer signal with the `abort-controller` package type; it is the
+    // Node AbortSignal at runtime.
+    const call: ApiCall = {
+      method,
+      payload: payload as Record<string, unknown>,
+      signal: signal as unknown as AbortSignal | undefined,
+    };
     calls.push(call);
     return (await respond(call)) as never;
   });
@@ -34,13 +41,21 @@ export const BOT_INFO = {
   has_main_web_app: false,
 };
 
-export function messageUpdate(updateId: number, userId: number, text: string): Update {
+export function messageUpdate(
+  updateId: number,
+  userId: number,
+  text: string,
+  chatType: "private" | "supergroup" = "private",
+): Update {
   return {
     update_id: updateId,
     message: {
       message_id: updateId,
       date: 1_700_000_000,
-      chat: { id: userId, type: "private", first_name: "Tester" },
+      chat:
+        chatType === "private"
+          ? { id: userId, type: "private", first_name: "Tester" }
+          : { id: -100_000 - userId, type: "supergroup", title: "Group" },
       from: { id: userId, is_bot: false, first_name: "Tester" },
       text,
       ...(text.startsWith("/")
