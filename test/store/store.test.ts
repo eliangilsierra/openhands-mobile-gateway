@@ -1,4 +1,5 @@
-import { writeFileSync } from "node:fs";
+import { statSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ChatStateRepository } from "../../src/store/chat-state.js";
@@ -13,6 +14,7 @@ import {
   type Migration,
 } from "../../src/store/schema-migration.js";
 import { SeenEventRepository } from "../../src/store/seen-event.js";
+import { runInTransaction } from "../../src/store/transaction.js";
 import { SQLITE_BUSY_RETRY_DELAYS_MS, withBusyRetry } from "../../src/store/retry.js";
 import { createRecordingLogger, createTempDbPath } from "./helpers.js";
 
@@ -314,5 +316,101 @@ describe("SQLITE_BUSY retry", () => {
       }),
     ).toThrow("boom");
     expect(calls).toBe(1);
+  });
+});
+
+describe("busy detection with extended result codes", () => {
+  it.each([5, 261, 517])("retries when errcode is %i", (errcode) => {
+    let calls = 0;
+    const result = withBusyRetry(createRecordingLogger(), "test", () => {
+      calls += 1;
+      if (calls < 2) {
+        throw Object.assign(new Error("database is locked"), { code: "ERR_SQLITE_ERROR", errcode });
+      }
+      return "ok";
+    });
+    expect(result).toBe("ok");
+    expect(calls).toBe(2);
+  });
+
+  it("does not retry a non-busy extended code such as SQLITE_CONSTRAINT_UNIQUE (2067)", () => {
+    let calls = 0;
+    expect(() =>
+      withBusyRetry(createRecordingLogger(), "test", () => {
+        calls += 1;
+        throw Object.assign(new Error("unique"), { code: "ERR_SQLITE_ERROR", errcode: 2067 });
+      }),
+    ).toThrow("unique");
+    expect(calls).toBe(1);
+  });
+});
+
+describe("file permissions", () => {
+  it("creates the directory 0700 and the db, -wal and -shm files 0600", () => {
+    const fresh = createTempDbPath();
+    try {
+      const nested = join(dirname(fresh.path), "data", "store");
+      const dbPath = join(nested, "gateway.db");
+      const conn = openStore({ databasePath: dbPath, logger });
+      new ChatStateRepository(conn, logger).setActiveProject("telegram", "1", "alpha");
+      expect(statSync(nested).mode & 0o777).toBe(0o700);
+      for (const suffix of ["", "-wal", "-shm"]) {
+        expect(statSync(`${dbPath}${suffix}`).mode & 0o777).toBe(0o600);
+      }
+      closeStore(conn);
+    } finally {
+      fresh.cleanup();
+    }
+  });
+});
+
+describe("StoreCorruptError messages", () => {
+  it("contains neither the absolute path nor raw quick_check output; the log carries the detail", () => {
+    closeStore(db);
+    writeFileSync(temp.path, "this is definitely not a sqlite database file");
+    const l = createRecordingLogger();
+    let caught: unknown;
+    try {
+      openStore({ databasePath: temp.path, logger: l });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(StoreCorruptError);
+    const message = (caught as Error).message;
+    expect(message).not.toContain(temp.path);
+    expect(message).not.toContain(dirname(temp.path));
+    expect(message).not.toMatch(/malformed|not a database|corrupt:/i);
+  });
+});
+
+describe("runInTransaction", () => {
+  it("commits the cursor advance and the seen_event insert together", () => {
+    const cursor = new EventCursorRepository(db, logger);
+    const seen = new SeenEventRepository(db, logger);
+    runInTransaction(db, logger, () => {
+      cursor.advance("c1", "e1", "2026-10-10T00:00:00.000Z");
+      seen.markSeen("c1", "e1");
+    });
+    expect(cursor.read("c1")?.lastEventId).toBe("e1");
+    expect(seen.hasSeen("c1", "e1")).toBe(true);
+  });
+
+  it("rolls both back when the callback throws", () => {
+    const cursor = new EventCursorRepository(db, logger);
+    const seen = new SeenEventRepository(db, logger);
+    expect(() =>
+      runInTransaction(db, logger, () => {
+        cursor.advance("c1", "e1", "2026-10-10T00:00:00.000Z");
+        seen.markSeen("c1", "e1");
+        throw new Error("boom");
+      }),
+    ).toThrow("boom");
+    expect(cursor.read("c1")).toBeNull();
+    expect(seen.hasSeen("c1", "e1")).toBe(false);
+    expect(db.isTransaction).toBe(false);
+  });
+
+  it("returns the callback result", () => {
+    expect(runInTransaction(db, logger, () => 42)).toBe(42);
   });
 });

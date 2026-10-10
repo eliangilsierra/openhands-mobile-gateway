@@ -7,7 +7,11 @@ import type { Logger } from "../logger.js";
  */
 export const SQLITE_BUSY_RETRY_DELAYS_MS: readonly number[] = [50, 100, 200];
 
-/** The raw `sqlite3_errcode` for `SQLITE_BUSY` (https://www.sqlite.org/rescode.html#busy). */
+/**
+ * The primary result code for `SQLITE_BUSY` (https://www.sqlite.org/rescode.html#busy). Extended
+ * codes (for example `SQLITE_BUSY_RECOVERY` 261, `SQLITE_BUSY_SNAPSHOT` 517) keep it in the low
+ * byte, so detection masks with `0xff`.
+ */
 const SQLITE_BUSY_ERRCODE = 5;
 
 interface NodeSqliteError extends Error {
@@ -20,13 +24,18 @@ function isSqliteBusyError(error: unknown): boolean {
     return false;
   }
   const sqliteError = error as NodeSqliteError;
-  return sqliteError.code === "ERR_SQLITE_ERROR" && sqliteError.errcode === SQLITE_BUSY_ERRCODE;
+  return (
+    sqliteError.code === "ERR_SQLITE_ERROR" &&
+    typeof sqliteError.errcode === "number" &&
+    (sqliteError.errcode & 0xff) === SQLITE_BUSY_ERRCODE
+  );
 }
 
 /**
  * Blocks the current thread for `ms` milliseconds. `node:sqlite`'s `DatabaseSync` is a
  * synchronous API, so the backoff between retries must also be synchronous; `Atomics.wait` on a
- * throwaway buffer is the standard way to do that in Node without a native dependency.
+ * throwaway buffer is the standard way to do that in Node without a native dependency. It blocks
+ * the event loop for the whole delay (at most 350 ms per failed operation).
  */
 function sleepSync(ms: number): void {
   const buffer = new SharedArrayBuffer(4);

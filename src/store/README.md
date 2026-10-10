@@ -53,4 +53,12 @@ outside `src/store/` must never write SQL themselves.
 `withBusyRetry(logger, kind, fn)` wraps every repository statement. On `SQLITE_BUSY` it retries
 up to 3 times with 50/100/200 ms backoff (architecture §10), logging each retry; any other error,
 or a `SQLITE_BUSY` on the last retry, propagates so the single operation fails while the process
-keeps running.
+keeps running. Busy detection masks the result code with `0xff`, so extended codes (261, 517)
+retry too. The backoff uses `Atomics.wait`, which blocks the event loop for up to 350 ms per
+failed operation; this is acceptable for a single-process gateway with a 5 s `busy_timeout`.
+
+## Transactions and file modes
+
+`runInTransaction(db, logger, fn)` (`transaction.ts`) runs several repository calls atomically,
+for example `EventCursorRepository.advance` plus `SeenEventRepository.markSeen`. The database
+directory is created `0700` and the database, `-wal` and `-shm` files are `0600`.

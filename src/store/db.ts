@@ -1,3 +1,5 @@
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync } from "node:fs";
+import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { Logger } from "../logger.js";
 import { StoreCorruptError } from "./errors.js";
@@ -14,8 +16,8 @@ import { MIGRATIONS } from "./migrations/index.js";
  * with `better-sqlite3` that this decision is a contained, reversible detail inside this module,
  * exactly as ADR-0003 point 5 anticipates; (2) it needs no native build step in the Docker
  * builder stage, which ADR-0003's "Negative consequences" section calls out as a `better-sqlite3`
- * cost; (3) Node 22.11+ ships it without the `--experimental-sqlite` flag (the project's
- * `engines.node` is `>=22`, and the runtime used in CI/this task is 22.23), with the same
+ * cost; (3) Node ships it without the `--experimental-sqlite` flag since 22.13.0 (the project's
+ * `engines.node` is `>=22.13`; it still prints an ExperimentalWarning), with the same
  * pragmas, parameterised statements and transaction semantics this task needs.
  */
 
@@ -31,22 +33,44 @@ interface QuickCheckRow {
   readonly quick_check: string;
 }
 
-function assertQuickCheckOk(db: DatabaseSync, databasePath: string): void {
+// Error messages carry neither the absolute path nor the raw quick_check output; the detail goes
+// to the structured log only.
+function assertQuickCheckOk(db: DatabaseSync, logger: Logger): void {
   let rows: readonly QuickCheckRow[];
   try {
     rows = db.prepare("PRAGMA quick_check").all() as unknown as readonly QuickCheckRow[];
   } catch (error) {
-    throw new StoreCorruptError(`Database at ${databasePath} failed PRAGMA quick_check`, {
-      cause: error,
+    logger.error("SQLite quick_check could not run", {
+      event: "store.quick_check_failed",
+      err_msg: error instanceof Error ? error.message : "unknown",
     });
+    throw new StoreCorruptError("Database failed PRAGMA quick_check", { cause: error });
   }
 
   const isOk = rows.length === 1 && rows[0]?.quick_check === "ok";
   if (!isOk) {
-    const detail = rows.map((row) => row.quick_check).join("; ");
-    throw new StoreCorruptError(
-      `Database at ${databasePath} failed PRAGMA quick_check: ${detail}`,
-    );
+    logger.error("SQLite quick_check reported corruption", {
+      event: "store.quick_check_failed",
+      err_msg: rows.map((row) => row.quick_check).join("; "),
+    });
+    throw new StoreCorruptError("Database failed PRAGMA quick_check");
+  }
+}
+
+/**
+ * The store holds conversation bindings and pending confirmations, so only the owner may read it:
+ * the parent directory is created `0700` and the database file `0600` before SQLite opens it, so
+ * SQLite's `-wal`/`-shm` side files inherit the mode. Existing side files are tightened too. An
+ * already existing parent directory is left as the operator configured it.
+ */
+function prepareDatabaseFile(databasePath: string): void {
+  mkdirSync(dirname(databasePath), { recursive: true, mode: 0o700 });
+  closeSync(openSync(databasePath, "a", 0o600));
+  for (const suffix of ["", "-wal", "-shm"]) {
+    const file = `${databasePath}${suffix}`;
+    if (existsSync(file)) {
+      chmodSync(file, 0o600);
+    }
   }
 }
 
@@ -61,9 +85,10 @@ export function openStore(options: OpenStoreOptions): DatabaseSync {
 
   let db: DatabaseSync;
   try {
+    prepareDatabaseFile(databasePath);
     db = new DatabaseSync(databasePath);
   } catch (error) {
-    throw new StoreCorruptError(`Failed to open database at ${databasePath}`, { cause: error });
+    throw new StoreCorruptError("Failed to open database", { cause: error });
   }
 
   try {
@@ -73,13 +98,11 @@ export function openStore(options: OpenStoreOptions): DatabaseSync {
     db.exec("PRAGMA synchronous=NORMAL");
   } catch (error) {
     db.close();
-    throw new StoreCorruptError(`Database at ${databasePath} is unreadable or corrupt`, {
-      cause: error,
-    });
+    throw new StoreCorruptError("Database is unreadable or corrupt", { cause: error });
   }
 
   try {
-    assertQuickCheckOk(db, databasePath);
+    assertQuickCheckOk(db, logger);
   } catch (error) {
     db.close();
     throw error;
