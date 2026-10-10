@@ -88,11 +88,12 @@ export interface OpenHandsRestClientOptions {
 }
 
 export interface OpenHandsRestClient {
-  getServerInfo(): Promise<ServerInfo>;
+  /** `signal` aborts the in-flight request (used by the health probe); aborted reads are not retried. */
+  getServerInfo(signal?: AbortSignal): Promise<ServerInfo>;
   getOpenApi(): Promise<OpenApiDocument>;
   createConversation(request: CreateConversationRequest): Promise<ConversationInfo>;
   getConversation(id: string): Promise<ConversationInfo>;
-  countConversations(): Promise<number>;
+  countConversations(signal?: AbortSignal): Promise<number>;
   sendEvent(id: string, request: SendEventRequest): Promise<unknown>;
   runConversation(id: string): Promise<unknown>;
   pauseConversation(id: string): Promise<unknown>;
@@ -116,6 +117,8 @@ interface CallSpec {
   readonly conversationScoped?: boolean;
   /** True for `/run`: a 409 means it is already running. */
   readonly conflictMeansRunning?: boolean;
+  /** Caller-supplied abort signal, combined with the per-request timeout. */
+  readonly signal?: AbortSignal;
 }
 
 const UNAVAILABLE_STATUSES: ReadonlySet<number> = new Set([502, 503, 504]);
@@ -208,7 +211,8 @@ export function createOpenHandsRestClient(options: OpenHandsRestClientOptions): 
       headers["Content-Type"] = "application/json";
     }
 
-    const signal = AbortSignal.timeout(timeout);
+    const timeoutSignal = AbortSignal.timeout(timeout);
+    const signal = spec.signal === undefined ? timeoutSignal : AbortSignal.any([timeoutSignal, spec.signal]);
     let response: Response;
     try {
       response = await fetch(url, {
@@ -299,7 +303,7 @@ export function createOpenHandsRestClient(options: OpenHandsRestClientOptions): 
             status: 401,
           });
         }
-        if (!(error instanceof UnavailableError) || n >= attempts) {
+        if (!(error instanceof UnavailableError) || n >= attempts || spec.signal?.aborted === true) {
           throw error;
         }
         logger?.warn("OpenHands read failed, retrying", {
@@ -331,7 +335,8 @@ export function createOpenHandsRestClient(options: OpenHandsRestClientOptions): 
   }
 
   return {
-    getServerInfo: () => call({ method: "GET", route: "/server_info", path: "/server_info" }),
+    getServerInfo: (signal) =>
+      call({ method: "GET", route: "/server_info", path: "/server_info", ...(signal ? { signal } : {}) }),
     getOpenApi: () => call({ method: "GET", route: "/openapi.json", path: "/openapi.json" }),
     createConversation: (request) =>
       call({ method: "POST", route: "/api/conversations", path: "/api/conversations", body: request }),
@@ -339,11 +344,12 @@ export function createOpenHandsRestClient(options: OpenHandsRestClientOptions): 
       const { path, template } = conv(id);
       return call({ method: "GET", route: template, path, conversationScoped: true });
     },
-    countConversations: () =>
+    countConversations: (signal) =>
       call({
         method: "GET",
         route: "/api/conversations/count",
         path: "/api/conversations/count",
+        ...(signal ? { signal } : {}),
       }),
     sendEvent: (id, request) => post(id, "/events", request),
     runConversation: (id) => post(id, "/run", undefined, true),

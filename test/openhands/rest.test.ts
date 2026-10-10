@@ -279,6 +279,21 @@ describe("timeouts and transport failures", () => {
     expect(server.requests).toHaveLength(2);
   });
 
+  it("a caller signal aborts a hanging read quickly, without retry or backoff sleep (QA-15, QA-16)", async () => {
+    server.addRule({ method: "GET", path: "/server_info", hang: true });
+    const controller = new AbortController();
+    const started = Date.now();
+    const pending = makeClient({ requestTimeoutMs: 60_000 })
+      .getServerInfo(controller.signal)
+      .catch((e: unknown) => e);
+    setTimeout(() => controller.abort(), 50);
+    const error = await pending;
+    expect(error).toBeInstanceOf(UnavailableError);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(sleep).not.toHaveBeenCalled();
+    expect(server.requests).toHaveLength(1);
+  });
+
   it("maps a refused connection to UnavailableError", async () => {
     const client = createOpenHandsRestClient({
       baseUrl: "http://127.0.0.1:1",
@@ -495,16 +510,28 @@ describe("T-AC-5: all HTTP access lives in src/openhands/rest.ts", () => {
   });
 
   it.each([
-    ["the OpenHands client package", /@openhands\/typescript-client/],
-    ["fetch()", /\bfetch\s*\(/],
-    ["node:http(s)", /from\s+["'](?:node:)?https?["']/],
-    ["the session key header", /X-Session-API-Key/i],
-    ["undici/axios/got", /from\s+["'](?:undici|axios|got|node-fetch)["']/],
-  ])("no other module uses %s", (_label, pattern) => {
+    ["the OpenHands client package", /@openhands\/typescript-client/, []],
+    ["fetch()", /\bfetch\s*\(/, []],
+    // src/health.ts only *listens* (GET /health); it may import node:http, and the dedicated test
+    // below pins that it makes no outbound call. Matches static, bare, dynamic and require forms.
+    ["node:http(s)", /\b(?:from|import|require)\s*\(?\s*["'](?:node:)?https?["']/, ["src/health.ts"]],
+    ["the session key header", /X-Session-API-Key/i, []],
+    ["undici/axios/got", /from\s+["'](?:undici|axios|got|node-fetch)["']/, []],
+  ] as const)("no other module uses %s", (_label, pattern, exempt) => {
     const offenders = others
       .filter((file) => pattern.test(readFileSync(file, "utf-8")))
-      .map((file) => relative(process.cwd(), file).split(sep).join("/"));
+      .map((file) => relative(process.cwd(), file).split(sep).join("/"))
+      .filter((file) => !(exempt as readonly string[]).includes(file));
     expect(offenders).toEqual([]);
+  });
+
+  it("src/health.ts only listens: no outbound http calls and no node:https or node:net", () => {
+    const text = readFileSync(join(srcRoot, "health.ts"), "utf-8");
+    expect(text).not.toMatch(/\bhttps?\.(?:request|get)\s*\(/);
+    expect(text).not.toMatch(/\brequest\s*\(/);
+    expect(text).not.toMatch(/\bconnect\s*\(/);
+    expect(text).not.toMatch(/\b(?:from|import|require)\s*\(?\s*["'](?:node:)?https["']/);
+    expect(text).not.toMatch(/\b(?:from|import|require)\s*\(?\s*["'](?:node:)?net["']/);
   });
 
   it("rest.ts never imports the LLM subpaths or the package root (T-B4-2)", () => {
