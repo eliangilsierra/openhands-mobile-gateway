@@ -63,6 +63,7 @@ import type {
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 export const DEFAULT_MAX_ATTEMPTS = 3;
 export const DEFAULT_BACKOFF_BASE_MS = 250;
+export const DEFAULT_MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
 
 export interface RetryOptions {
   /** Total attempts for a GET (first try included). */
@@ -79,6 +80,8 @@ export interface OpenHandsRestClientOptions {
   readonly baseUrl: string;
   readonly apiKey: string;
   readonly requestTimeoutMs?: number;
+  /** Cap on a 2xx response body; larger bodies are an UnexpectedResponseError. Default 5 MiB. */
+  readonly maxResponseBytes?: number;
   readonly retry?: RetryOptions;
   readonly logger?: Logger;
 }
@@ -137,6 +140,13 @@ function parseBaseUrl(value: string): string {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new TypeError("OPENHANDS_BASE_URL must use http or https");
   }
+  // NIT-1: credentials, query and fragment would be silently mangled or leaked into requests.
+  if (url.username !== "" || url.password !== "") {
+    throw new TypeError("OPENHANDS_BASE_URL must not contain credentials");
+  }
+  if (url.search !== "" || url.hash !== "") {
+    throw new TypeError("OPENHANDS_BASE_URL must not contain a query or fragment");
+  }
   return url.href.replace(/\/+$/, "");
 }
 
@@ -167,6 +177,7 @@ export function createOpenHandsRestClient(options: OpenHandsRestClientOptions): 
   }
 
   const timeout = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  const maxResponseBytes = options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
   const maxAttempts = Math.max(1, options.retry?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS);
   const baseDelayMs = options.retry?.baseDelayMs ?? DEFAULT_BACKOFF_BASE_MS;
   const sleep =
@@ -192,29 +203,32 @@ export function createOpenHandsRestClient(options: OpenHandsRestClientOptions): 
       headers["Content-Type"] = "application/json";
     }
 
+    const signal = AbortSignal.timeout(timeout);
     let response: Response;
-    let text: string;
     try {
       response = await fetch(url, {
         method: spec.method,
         headers,
         // SR-2: never follow a redirect, so the key cannot be replayed to another origin.
         redirect: "manual",
-        signal: AbortSignal.timeout(timeout),
+        signal,
         ...(spec.method === "POST" && spec.body !== undefined ? { body: JSON.stringify(spec.body) } : {}),
       });
-      text = await response.text();
     } catch (error) {
       // Timeout or connection failure: no HTTP status. The cause is a fetch/abort error and
       // never contains request headers.
       throw new UnavailableError(context, { cause: error });
     }
 
-    // Any non-2xx (including every 3xx) is mapped from the status alone; the body is dropped
-    // so it cannot carry the key into an error or log line.
+    // CR-7: decide from the status alone, before touching the body. Any non-2xx (including
+    // every 3xx) is mapped without reading the body, so a stalled or hostile error body can
+    // neither change the mapping nor carry the key into an error or log line (LOW-1).
     if (response.status < 200 || response.status > 299) {
+      void response.body?.cancel().catch(() => undefined);
       throw mapHttpStatus(response.status, spec);
     }
+
+    const text = await readCappedText(response, context);
     if (text.length === 0) {
       return undefined as T;
     }
@@ -224,6 +238,47 @@ export function createOpenHandsRestClient(options: OpenHandsRestClientOptions): 
       // CR-1: a malformed 2xx body is a protocol problem, not an outage; never retried.
       throw new UnexpectedResponseError({ ...context, status: response.status }, { cause: error });
     }
+  }
+
+  /** Reads a 2xx body through a byte cap (LOW-1). Read failure or timeout is an outage. */
+  async function readCappedText(
+    response: Response,
+    context: OpenHandsErrorContext,
+  ): Promise<string> {
+    const body = response.body;
+    if (body === null) {
+      return "";
+    }
+    const tooLarge = (): UnexpectedResponseError =>
+      new UnexpectedResponseError({ ...context, status: response.status });
+    const declared = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > maxResponseBytes) {
+      void body.cancel().catch(() => undefined);
+      throw tooLarge();
+    }
+    const reader = body.getReader();
+    const chunks: Uint8Array[] = [];
+    let received = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        received += value.byteLength;
+        if (received > maxResponseBytes) {
+          void reader.cancel().catch(() => undefined);
+          throw tooLarge();
+        }
+        chunks.push(value);
+      }
+    } catch (error) {
+      if (error instanceof UnexpectedResponseError) {
+        throw error;
+      }
+      throw new UnavailableError(context, { cause: error });
+    }
+    return Buffer.concat(chunks).toString("utf-8");
   }
 
   async function call<T>(spec: CallSpec): Promise<T> {

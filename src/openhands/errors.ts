@@ -58,12 +58,15 @@ export class UnavailableError extends OpenHandsError {
     const detail = context.status === undefined ? "no response" : `status ${context.status}`;
     super(`OpenHands unavailable: ${detail} (${context.method} ${context.route})`, context, options);
     this.name = "UnavailableError";
-    this.outcomeUnknown = context.method !== "GET" && context.status === undefined;
+    // CR-6: a gateway timeout/bad gateway on a non-GET may hide a request the origin applied.
+    this.outcomeUnknown =
+      context.method !== "GET" &&
+      (context.status === undefined || context.status === 502 || context.status === 504);
   }
 
   /**
-   * True for a non-GET request that failed without any response (timeout, reset): the server
-   * may or may not have applied it, so callers must not assume it was not executed.
+   * True for a non-GET request that failed without any response (timeout, reset) or with 502
+   * or 504 from a proxy: the server may or may not have applied it, so callers must not assume it was not executed.
    */
   readonly outcomeUnknown: boolean;
 }

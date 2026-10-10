@@ -29,6 +29,12 @@ export interface MockRule {
   readonly body?: unknown;
   /** Sent verbatim instead of `body` (e.g. malformed JSON). */
   readonly raw?: string;
+  /** Answer with a JSON body padded to roughly this many bytes. */
+  readonly bodyBytes?: number;
+  /** Send the headers and a first chunk, then never finish the body. */
+  readonly stallBody?: boolean;
+  /** Send the headers and a first chunk, then destroy the connection. */
+  readonly abortBody?: boolean;
   /** Extra response headers (e.g. `location` for a redirect). */
   readonly headers?: Readonly<Record<string, string>>;
 }
@@ -139,6 +145,19 @@ export async function startMockOpenHandsServer(expectedKey: string): Promise<Moc
           rule.times -= 1;
         }
         if (rule.hang === true) {
+          return;
+        }
+        if (rule.stallBody === true || rule.abortBody === true) {
+          res.writeHead(rule.status ?? 200, { "content-type": "application/json", ...rule.headers });
+          res.write('{"partial":');
+          if (rule.abortBody === true) {
+            setTimeout(() => res.destroy(), 10);
+          }
+          return;
+        }
+        if (rule.bodyBytes !== undefined) {
+          res.writeHead(rule.status ?? 200, { "content-type": "application/json", ...rule.headers });
+          res.end(JSON.stringify({ pad: "x".repeat(rule.bodyBytes) }));
           return;
         }
         if (rule.raw !== undefined) {

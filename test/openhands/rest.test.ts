@@ -18,7 +18,9 @@ const CID = "c0ffee00-0000-4000-8000-000000000001";
 let server: MockOpenHandsServer;
 const sleep = vi.fn((_ms: number) => Promise.resolve());
 
-function makeClient(overrides: { requestTimeoutMs?: number; key?: string; lines?: string[] } = {}): OpenHandsRestClient {
+function makeClient(
+  overrides: { requestTimeoutMs?: number; key?: string; lines?: string[]; maxResponseBytes?: number } = {},
+): OpenHandsRestClient {
   const lines = overrides.lines;
   const logger = lines
     ? createLogger({ level: "debug", secrets: [], write: (line) => lines.push(line) })
@@ -27,6 +29,7 @@ function makeClient(overrides: { requestTimeoutMs?: number; key?: string; lines?
     baseUrl: server.baseUrl,
     apiKey: overrides.key ?? KEY,
     ...(overrides.requestTimeoutMs !== undefined ? { requestTimeoutMs: overrides.requestTimeoutMs } : {}),
+    ...(overrides.maxResponseBytes !== undefined ? { maxResponseBytes: overrides.maxResponseBytes } : {}),
     retry: { maxAttempts: 3, baseDelayMs: 100, sleep, random: () => 0 },
     ...(logger ? { logger } : {}),
   });
@@ -372,6 +375,18 @@ describe("SR-3: base URL scheme", () => {
     },
   );
 
+  it.each(["http://u:p@h", "http://h/?a=1", "http://h/#f", "http://u@h/"])(
+    "refuses credentials, query or fragment: %s",
+    (baseUrl) => {
+      expect(() => createOpenHandsRestClient({ baseUrl, apiKey: KEY })).toThrow(TypeError);
+    },
+  );
+
+  it("accepts a trailing slash and a path prefix", () => {
+    expect(() => createOpenHandsRestClient({ baseUrl: "http://host:8000/", apiKey: KEY })).not.toThrow();
+    expect(() => createOpenHandsRestClient({ baseUrl: "http://host:8000/prefix", apiKey: KEY })).not.toThrow();
+  });
+
   it("accepts http and https", () => {
     expect(() => createOpenHandsRestClient({ baseUrl: "http://agentcanvas:8000/", apiKey: KEY })).not.toThrow();
     expect(() => createOpenHandsRestClient({ baseUrl: "https://agentcanvas.example", apiKey: KEY })).not.toThrow();
@@ -379,16 +394,24 @@ describe("SR-3: base URL scheme", () => {
 });
 
 describe("CR-3, CR-4, SR-4: outcome flag, retry log, jitter", () => {
-  it("flags a timed-out POST as outcomeUnknown but not a timed-out GET or a 502 POST", async () => {
+  it("flags a timed-out POST, and a 502 or 504 POST, as outcomeUnknown; a 503 POST and a 502 GET are not", async () => {
     server.addRule({ method: "POST", path: `/api/conversations/${CID}/events`, hang: true, times: 1 });
     const post = await makeClient({ requestTimeoutMs: 100 })
       .sendEvent(CID, { role: "user", content: "x", run: true })
       .catch((e: unknown) => e);
     expect((post as UnavailableError).outcomeUnknown).toBe(true);
 
-    server.addRule({ method: "POST", path: `/api/conversations/${CID}/pause`, status: 502 });
-    const bad = await makeClient().pauseConversation(CID).catch((e: unknown) => e);
-    expect((bad as UnavailableError).outcomeUnknown).toBe(false);
+    for (const [status, expected] of [[502, true], [504, true], [503, false]] as const) {
+      server.clearRules();
+      server.addRule({ method: "POST", path: `/api/conversations/${CID}/pause`, status });
+      const bad = await makeClient().pauseConversation(CID).catch((e: unknown) => e);
+      expect(bad).toBeInstanceOf(UnavailableError);
+      expect((bad as UnavailableError).outcomeUnknown).toBe(expected);
+    }
+    server.clearRules();
+    server.addRule({ method: "GET", path: "/api/workspaces", status: 502 });
+    const get = await makeClient().listWorkspaces().catch((e: unknown) => e);
+    expect((get as UnavailableError).outcomeUnknown).toBe(false);
   });
 
   it("logs the retry without a bogus status when there was no response", async () => {
@@ -409,6 +432,46 @@ describe("CR-3, CR-4, SR-4: outcome flag, retry log, jitter", () => {
     });
     await client.listWorkspaces();
     expect(sleep.mock.calls.map((c) => c[0])).toEqual([110, 220]);
+  });
+});
+
+describe("CR-7, LOW-1: body handling", () => {
+  it.each([
+    ["stalls", { stallBody: true }],
+    ["aborts", { abortBody: true }],
+  ] as const)("a 401 whose body %s still maps to AuthError", async (_label, rule) => {
+    server.addRule({ method: "GET", path: "/api/workspaces", status: 401, ...rule });
+    await expect(makeClient({ requestTimeoutMs: 500 }).listWorkspaces()).rejects.toBeInstanceOf(AuthError);
+  });
+
+  it.each([
+    ["stalls", { stallBody: true }],
+    ["aborts", { abortBody: true }],
+  ] as const)("a 404 whose body %s still maps to NotFoundError", async (_label, rule) => {
+    server.addRule({ method: "GET", path: `/api/conversations/${CID}`, status: 404, ...rule });
+    await expect(makeClient({ requestTimeoutMs: 500 }).getConversation(CID)).rejects.toBeInstanceOf(NotFoundError);
+  });
+
+  it("rejects a 2xx body over the cap without retrying", async () => {
+    server.addRule({ method: "GET", path: "/api/workspaces", status: 200, bodyBytes: 4096 });
+    const error = await makeClient({ maxResponseBytes: 1024 }).listWorkspaces().catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(UnexpectedResponseError);
+    expect((error as UnexpectedResponseError).status).toBe(200);
+    expect(server.requests.filter((r) => r.path === "/api/workspaces")).toHaveLength(1);
+  });
+
+  it("parses a 2xx body under the cap", async () => {
+    server.addRule({ method: "GET", path: "/api/workspaces", status: 200, bodyBytes: 100 });
+    await expect(makeClient({ maxResponseBytes: 1024 }).listWorkspaces()).resolves.toEqual({
+      pad: "x".repeat(100),
+    });
+  });
+
+  it("a stalled 2xx body is an outage, with outcomeUnknown on a POST", async () => {
+    server.addRule({ method: "POST", path: `/api/conversations/${CID}/pause`, status: 200, stallBody: true });
+    const error = await makeClient({ requestTimeoutMs: 200 }).pauseConversation(CID).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(UnavailableError);
+    expect((error as UnavailableError).outcomeUnknown).toBe(true);
   });
 });
 
