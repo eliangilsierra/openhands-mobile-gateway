@@ -48,6 +48,12 @@ outside `src/store/` must never write SQL themselves.
 | `pending-confirmation.ts` | `pending_confirmation` | Allow/Deny prompts; `prune()` deletes rows resolved more than 7 days ago |
 | `schema-migration.ts` | `schema_migration` | the migration runner plus read-only access to the applied version |
 
+## Supported database targets
+
+Only plain filesystem paths and `:memory:` (or the empty path, a private temporary database) are
+supported. `file:` URIs are rejected with a `StoreError` because they would bypass the 0700/0600
+file hardening.
+
 ## Retry policy (`retry.ts`)
 
 `withBusyRetry(logger, kind, fn)` wraps every repository statement. On `SQLITE_BUSY` it retries

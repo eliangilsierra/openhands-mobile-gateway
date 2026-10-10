@@ -2,7 +2,7 @@ import { chmodSync, closeSync, existsSync, mkdirSync, openSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { Logger } from "../logger.js";
-import { StoreCorruptError } from "./errors.js";
+import { StoreCorruptError, StoreError } from "./errors.js";
 import { runMigrations } from "./schema-migration.js";
 import { MIGRATIONS } from "./migrations/index.js";
 
@@ -64,8 +64,8 @@ function assertQuickCheckOk(db: DatabaseSync, logger: Logger): void {
  * already existing parent directory is left as the operator configured it.
  */
 function prepareDatabaseFile(databasePath: string): void {
-  // In-memory (":memory:"), empty (temporary) and URI ("file:...") targets are not plain files.
-  if (databasePath === "" || databasePath === ":memory:" || databasePath.startsWith("file:")) {
+  // In-memory (":memory:") and empty (temporary) targets are not plain files.
+  if (databasePath === "" || databasePath === ":memory:") {
     return;
   }
   mkdirSync(dirname(databasePath), { recursive: true, mode: 0o700 });
@@ -86,6 +86,13 @@ function prepareDatabaseFile(databasePath: string): void {
  */
 export function openStore(options: OpenStoreOptions): DatabaseSync {
   const { databasePath, logger } = options;
+
+  // URI targets would bypass the file hardening above, so they are rejected up front.
+  if (databasePath.startsWith("file:")) {
+    throw new StoreError(
+      'Unsupported database target: "file:" URIs are not supported; use a plain path or ":memory:"',
+    );
+  }
 
   let db: DatabaseSync;
   try {

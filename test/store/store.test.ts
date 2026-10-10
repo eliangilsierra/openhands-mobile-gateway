@@ -4,7 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ChatStateRepository } from "../../src/store/chat-state.js";
 import { ConversationBindingRepository } from "../../src/store/conversation-binding.js";
-import { closeStore, openStore, StoreCorruptError } from "../../src/store/db.js";
+import { closeStore, openStore, StoreCorruptError, StoreError } from "../../src/store/db.js";
 import { EventCursorRepository } from "../../src/store/event-cursor.js";
 import { MIGRATIONS } from "../../src/store/migrations/index.js";
 import { PendingConfirmationRepository } from "../../src/store/pending-confirmation.js";
@@ -356,6 +356,27 @@ describe("in-memory database", () => {
       expect(repo.getActiveProject("telegram", "1")).toBe("alpha");
     } finally {
       closeStore(mem);
+    }
+  });
+});
+
+describe("unsupported file: URIs", () => {
+  it("throws a StoreError without echoing the path and creates no file", () => {
+    const fresh = createTempDbPath();
+    try {
+      const target = `file:${fresh.path}`;
+      let caught: unknown;
+      try {
+        openStore({ databasePath: target, logger });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(StoreError);
+      expect((caught as Error).message).not.toContain(fresh.path);
+      expect(existsSync(fresh.path)).toBe(false);
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      fresh.cleanup();
     }
   });
 });
