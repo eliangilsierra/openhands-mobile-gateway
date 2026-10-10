@@ -495,15 +495,17 @@ describe("T-AC-5: all HTTP access lives in src/openhands/rest.ts", () => {
   });
 
   it.each([
-    ["the OpenHands client package", /@openhands\/typescript-client/],
-    ["fetch()", /\bfetch\s*\(/],
-    ["node:http(s)", /from\s+["'](?:node:)?https?["']/],
-    ["the session key header", /X-Session-API-Key/i],
-    ["undici/axios/got", /from\s+["'](?:undici|axios|got|node-fetch)["']/],
-  ])("no other module uses %s", (_label, pattern) => {
+    ["the OpenHands client package", /@openhands\/typescript-client/, []],
+    ["fetch()", /\bfetch\s*\(/, []],
+    // src/health.ts only *listens* (GET /health); it makes no outbound call, so it may import it.
+    ["node:http(s)", /from\s+["'](?:node:)?https?["']/, ["src/health.ts"]],
+    ["the session key header", /X-Session-API-Key/i, []],
+    ["undici/axios/got", /from\s+["'](?:undici|axios|got|node-fetch)["']/, []],
+  ] as const)("no other module uses %s", (_label, pattern, exempt) => {
     const offenders = others
       .filter((file) => pattern.test(readFileSync(file, "utf-8")))
-      .map((file) => relative(process.cwd(), file).split(sep).join("/"));
+      .map((file) => relative(process.cwd(), file).split(sep).join("/"))
+      .filter((file) => !(exempt as readonly string[]).includes(file));
     expect(offenders).toEqual([]);
   });
 
