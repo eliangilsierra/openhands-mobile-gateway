@@ -173,7 +173,7 @@ export class TelegramPoller {
 
   private markHealthy(): void {
     this.failures = 0;
-    this.status.set("connected");
+    this.status.setConnected();
     if (this.degraded) {
       this.degraded = false;
       this.logger.info("Telegram polling recovered", { event: "telegram.poll.recovered" });
@@ -187,7 +187,7 @@ export class TelegramPoller {
     const code = error instanceof GrammyError ? error.error_code : undefined;
 
     if (code === 429 && error instanceof GrammyError) {
-      this.status.set("disconnected");
+      this.status.setDisconnected("rate_limited");
       const retryAfter = error.parameters.retry_after ?? 1;
       this.logger.warn("Telegram rate limit on getUpdates", {
         event: "telegram.poll.rate_limited",
@@ -199,21 +199,21 @@ export class TelegramPoller {
     }
 
     if (code === 409) {
-      this.status.set("conflict");
+      this.status.setDisconnected("conflict");
       this.logger.error("getUpdates conflict: another poller or a webhook is active", {
         event: "telegram.poll.conflict",
         err_type: errType,
         err_msg: errMsg,
       });
     } else if (code === 401 || code === 404) {
-      this.status.set("unauthorized");
+      this.status.setDisconnected("unauthorized");
       this.logger.error("Telegram rejected the bot token (revoked or invalid); fix TELEGRAM_BOT_TOKEN", {
         event: "telegram.poll.unauthorized",
         err_type: errType,
         status: code,
       });
     } else {
-      this.status.set("disconnected");
+      this.status.setDisconnected("network");
       this.logger.warn("getUpdates failed, will retry", {
         event: "telegram.poll.error",
         err_type: errType,

@@ -11,12 +11,12 @@ import {
 } from "../../../src/channels/telegram/bot.js";
 import { HELP_TEXT } from "../../../src/channels/telegram/commands/help.js";
 import {
+  DEFAULT_MAX_TRACKED_SENDERS,
+  DEFAULT_REJECTION_WINDOW_MS,
   hashUserId,
   RejectionThrottle,
   UNAUTHORIZED_TEXT,
 } from "../../../src/channels/telegram/middleware/allowlist.js";
-import type {} from "../../../src/channels/telegram/middleware/allowlist.js";
-// from "../../../src/channels/telegram/middleware/allowlist.js";
 import { TelegramStatus } from "../../../src/channels/telegram/status.js";
 import { ChatStateRepository } from "../../../src/store/chat-state.js";
 import { closeStore, openStore } from "../../../src/store/db.js";
@@ -189,6 +189,52 @@ describe("allowlist middleware", () => {
     expect(summaries[0]?.msg).toContain("Suppressed 1");
   });
 
+  it("SEC-MEDIUM-1: defaults are a 60 s window and 1000 tracked senders", async () => {
+    expect(DEFAULT_REJECTION_WINDOW_MS).toBe(60_000);
+    expect(DEFAULT_MAX_TRACKED_SENDERS).toBe(1_000);
+
+    // Through the real wiring, with no overrides: the 1001st distinct sender evicts the first one,
+    // which then gets a fresh reply and a summary even though its window has not elapsed.
+    let clock = 1_000_000;
+    const bot = createBot({ token: TOKEN, allowedUserIds: new Set([ALLOWED]), chatState, logger, allowlistSalt: SALT, now: () => clock });
+    bot.botInfo = BOT_INFO;
+    const calls = installFakeApi(bot, () => ({ ok: true, result: true }));
+    const poller = new TelegramPoller({ bot, logger, status: new TelegramStatus(), sleep: () => Promise.resolve() });
+    const first = STRANGER;
+
+    await poller.handle(messageUpdate(1, first, "a"));
+    await poller.handle(messageUpdate(2, first, "b"));
+    expect(sends(calls)).toHaveLength(1);
+    clock += DEFAULT_REJECTION_WINDOW_MS - 1;
+    await poller.handle(messageUpdate(3, first, "c"));
+    expect(sends(calls)).toHaveLength(1);
+
+    // 999 other senders fill the map to exactly 1000: nobody is evicted yet.
+    for (let i = 1; i < DEFAULT_MAX_TRACKED_SENDERS; i += 1) await poller.handle(messageUpdate(100 + i, first + i, "x"));
+    expect(sends(calls)).toHaveLength(DEFAULT_MAX_TRACKED_SENDERS);
+    expect(logger.records.some((r) => r.fields?.["event"] === "telegram.update.rejected_summary")).toBe(false);
+
+    // The 1001st sender evicts the oldest (the first), which is summarised and answered again.
+    await poller.handle(messageUpdate(5000, first + DEFAULT_MAX_TRACKED_SENDERS, "x"));
+    const summary = logger.records.find((r) => r.fields?.["event"] === "telegram.update.rejected_summary");
+    expect(summary?.msg).toContain("Suppressed 2");
+    await poller.handle(messageUpdate(5001, first, "again"));
+    expect(sends(calls)).toHaveLength(DEFAULT_MAX_TRACKED_SENDERS + 2);
+
+    // A fresh sender admitted at exactly the window boundary is answered again (window is 60 s, not more).
+    const boundaryBot = createBot({ token: TOKEN, allowedUserIds: new Set([ALLOWED]), chatState, logger, allowlistSalt: SALT, now: () => clock });
+    boundaryBot.botInfo = BOT_INFO;
+    const boundaryCalls = installFakeApi(boundaryBot, () => ({ ok: true, result: true }));
+    const boundary = new TelegramPoller({ bot: boundaryBot, logger, status: new TelegramStatus(), sleep: () => Promise.resolve() });
+    await boundary.handle(messageUpdate(1, first, "a"));
+    clock += DEFAULT_REJECTION_WINDOW_MS - 1;
+    await boundary.handle(messageUpdate(2, first, "b"));
+    expect(sends(boundaryCalls)).toHaveLength(1);
+    clock += 1;
+    await boundary.handle(messageUpdate(3, first, "c"));
+    expect(sends(boundaryCalls)).toHaveLength(2);
+  });
+
   it("hashes differ per salt and never contain the raw id", () => {
     expect(hashUserId(42, "a")).not.toBe(hashUserId(42, "b"));
     expect(hashUserId(42, "a")).toMatch(/^[0-9a-f]{12}$/);
@@ -254,15 +300,19 @@ describe("poller", () => {
     expect(sends(calls)).toHaveLength(2);
   });
 
-  it("T-AC-4: 409 logs ERROR, reports disconnected, retries and never calls deleteWebhook", async () => {
+  it("T-AC-4: 409 logs ERROR, reports disconnected with reason conflict, retries and never calls deleteWebhook", async () => {
     const ac = new AbortController();
     let polls = 0;
     const statusDuringConflict: string[] = [];
+    const reasonDuringConflict: (string | null)[] = [];
     const holder: { status?: TelegramStatus } = {};
     const { poller, calls, status, sleeps } = build((call) => {
       if (call.method !== "getUpdates") return { ok: true, result: true };
       polls += 1;
-      if (polls === 3 && holder.status) statusDuringConflict.push(holder.status.get());
+      if (polls === 3 && holder.status) {
+        statusDuringConflict.push(holder.status.get());
+        reasonDuringConflict.push(holder.status.reason());
+      }
       if (polls <= 2) return { ok: false, error_code: 409, description: "Conflict: terminated by other getUpdates request" };
       ac.abort();
       return { ok: true, result: [] };
@@ -270,16 +320,18 @@ describe("poller", () => {
     holder.status = status;
     await poller.run(ac.signal);
 
-    expect(statusDuringConflict).toEqual(["conflict"]);
+    expect(statusDuringConflict).toEqual(["disconnected"]);
+    expect(reasonDuringConflict).toEqual(["conflict"]);
     expect(logger.records.some((r) => r.fields?.["event"] === "telegram.poll.recovered")).toBe(true);
     const errors = logger.records.filter((r) => r.level === "error" && r.fields?.["event"] === "telegram.poll.conflict");
     expect(errors).toHaveLength(2);
     expect(calls.some((c) => c.method === "deleteWebhook")).toBe(false);
     expect(sleeps).toEqual([500, 1000]);
     expect(status.get()).toBe("connected");
+    expect(status.reason()).toBeNull();
   });
 
-  it("409 leaves the status at conflict while the conflict lasts", async () => {
+  it("409 keeps the status disconnected (reason conflict) while the conflict lasts", async () => {
     const ac = new AbortController();
     let polls = 0;
     const observed: string[] = [];
@@ -287,14 +339,14 @@ describe("poller", () => {
       if (call.method !== "getUpdates") return { ok: true, result: true };
       polls += 1;
       if (polls === 3) {
-        observed.push(status.get());
+        observed.push(`${status.get()}/${String(status.reason())}`);
         ac.abort();
         return { ok: true, result: [] };
       }
       return { ok: false, error_code: 409, description: "Conflict" };
     });
     await poller.run(ac.signal);
-    expect(observed).toEqual(["conflict"]);
+    expect(observed).toEqual(["disconnected/conflict"]);
   });
 
   it("429 honours retry_after", async () => {
@@ -407,7 +459,7 @@ describe("poller", () => {
     expect(sends(calls)).toHaveLength(2);
   });
 
-  it("CR-2: 401 logs a clear ERROR without the token, sets unauthorized and still backs off", async () => {
+  it("CR-2: 401 logs a clear ERROR without the token, reports disconnected (reason unauthorized) and still backs off", async () => {
     const ac = new AbortController();
     let polls = 0;
     const { poller, status, sleeps } = build((call) => {
@@ -418,10 +470,11 @@ describe("poller", () => {
       return { ok: true, result: [] };
     });
     const seen: string[] = [];
-    const observe = status.set.bind(status);
-    status.set = (state) => {
-      seen.push(state);
-      observe(state);
+    const observe = status.setDisconnected.bind(status);
+    status.setDisconnected = (reason) => {
+      seen.push(reason);
+      observe(reason);
+      expect(status.get()).toBe("disconnected");
     };
     await poller.run(ac.signal);
 
@@ -443,14 +496,14 @@ describe("poller", () => {
       if (call.method !== "getUpdates") return { ok: true, result: true };
       polls += 1;
       if (polls === 2) {
-        observed.push(status.get());
+        observed.push(`${status.get()}/${String(status.reason())}`);
         ac.abort();
         return { ok: true, result: [] };
       }
       return { ok: false, error_code: 404, description: "Not Found" };
     });
     await poller.run(ac.signal);
-    expect(observed).toEqual(["unauthorized"]);
+    expect(observed).toEqual(["disconnected/unauthorized"]);
   });
 
   it("SEC-LOW-2: handler errors are logged with a bounded, token-free message", async () => {
