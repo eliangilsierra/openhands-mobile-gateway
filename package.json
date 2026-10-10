@@ -9,7 +9,7 @@
   },
   "main": "dist/main.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
     "start": "node --enable-source-maps dist/main.js",
     "test": "vitest run",
     "test:watch": "vitest",

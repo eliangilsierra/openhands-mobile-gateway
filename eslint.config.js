@@ -21,7 +21,7 @@ export default [
   {
     // `test/fixtures/**` deliberately violates these rules; it is linted on purpose by
     // `test/eslint-child-process-ban.test.ts` (T-AC-6), not by the repo-wide `eslint .` run.
-    ignores: ["dist/**", "node_modules/**", "coverage/**", "test/fixtures/**"],
+    ignores: ["dist/**", "node_modules/**", "coverage/**", "test/fixtures/**", ".claude/**"],
   },
   eslint.configs.recommended,
   {

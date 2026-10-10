@@ -16,7 +16,7 @@ describe("createLogger", () => {
     logger.info("boot ok", { event: "boot.config_ok" });
 
     expect(lines).toHaveLength(1);
-    const record = JSON.parse(lines[0]);
+    const record = JSON.parse(lines[0] ?? "");
     expect(record).toMatchObject({
       ts: "2026-10-09T00:00:00.000Z",
       level: "info",
@@ -42,7 +42,7 @@ describe("createLogger", () => {
 
     expect(lines[0]).not.toContain("super-secret-token");
     expect(lines[0]).toContain("***");
-    const record = JSON.parse(lines[0]);
+    const record = JSON.parse(lines[0] ?? "");
     expect(record.err_msg).toBe("rejected key *** for /api/conversations");
   });
 
@@ -57,7 +57,7 @@ describe("createLogger", () => {
 
     logger.info("status", { event: "boot.config_ok", status: "telegram-bot-token-123" });
 
-    const record = JSON.parse(lines[0]);
+    const record = JSON.parse(lines[0] ?? "");
     expect(record.status).toBe("***");
   });
 
@@ -76,7 +76,7 @@ describe("createLogger", () => {
       not_on_allowlist: "anything",
     });
 
-    const record = JSON.parse(lines[0]);
+    const record = JSON.parse(lines[0] ?? "");
     expect(record).not.toHaveProperty("text");
     expect(record).not.toHaveProperty("content");
     expect(record).not.toHaveProperty("token");
@@ -100,8 +100,8 @@ describe("createLogger", () => {
       working_dir: "/projects/toneprofiler",
     });
 
-    const debugRecord = JSON.parse(lines[0]);
-    const infoRecord = JSON.parse(lines[1]);
+    const debugRecord = JSON.parse(lines[0] ?? "");
+    const infoRecord = JSON.parse(lines[1] ?? "");
     expect(debugRecord.working_dir).toBe("/projects/toneprofiler");
     expect(infoRecord).not.toHaveProperty("working_dir");
   });
@@ -116,7 +116,7 @@ describe("createLogger", () => {
       token: "abc",
     });
 
-    const record = JSON.parse(lines[0]);
+    const record = JSON.parse(lines[0] ?? "");
     expect(record).not.toHaveProperty("text");
     expect(record).not.toHaveProperty("token");
   });
@@ -130,6 +130,6 @@ describe("createLogger", () => {
     logger.warn("should appear", { event: "health.degraded" });
 
     expect(lines).toHaveLength(1);
-    expect(JSON.parse(lines[0]).msg).toBe("should appear");
+    expect(JSON.parse(lines[0] ?? "").msg).toBe("should appear");
   });
 });

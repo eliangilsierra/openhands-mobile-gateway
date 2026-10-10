@@ -11,7 +11,7 @@ export interface RecordingLogger extends Logger {
 export function createRecordingLogger(): RecordingLogger {
   const records: Array<{ level: string; msg: string; fields?: LoggableFields }> = [];
   const record = (level: string) => (msg: string, fields?: LoggableFields) => {
-    records.push({ level, msg, fields });
+    records.push(fields === undefined ? { level, msg } : { level, msg, fields });
   };
 
   return {
