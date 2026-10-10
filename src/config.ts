@@ -1,3 +1,4 @@
+import { isIP } from "node:net";
 import { z } from "zod";
 
 /**
@@ -21,6 +22,10 @@ export interface GatewayConfig {
   readonly databasePath: string;
   readonly logLevel: LogLevel;
   readonly healthPort: number;
+  /** Bind address of `/health`; loopback unless the operator opts into the Docker network. */
+  readonly healthHost: string;
+  /** Max age in seconds of the cached OpenHands probe behind `/health` (0 disables the cache). */
+  readonly healthCacheSeconds: number;
   readonly timezone: string;
 }
 
@@ -62,7 +67,14 @@ const telegramAllowedUserIds = z
       .array(
         z
           .string()
-          .regex(/^\d+$/, "TELEGRAM_ALLOWED_USER_IDS entries must be positive integers"),
+          .regex(/^\d+$/, "TELEGRAM_ALLOWED_USER_IDS entries must be positive integers")
+          .refine(
+            (part) => {
+              const id = Number(part);
+              return Number.isSafeInteger(id) && id > 0;
+            },
+            "TELEGRAM_ALLOWED_USER_IDS entries must be positive integers within the safe range",
+          ),
       )
       .min(1, "TELEGRAM_ALLOWED_USER_IDS must list at least one id"),
   )
@@ -89,6 +101,25 @@ const healthPort = z
   .transform((value) => Number.parseInt(value, 10))
   .pipe(z.number().int().min(1, "HEALTH_PORT must be a valid TCP port").max(65535, "HEALTH_PORT must be a valid TCP port"));
 
+const healthHost = z
+  .string()
+  .trim()
+  .optional()
+  .default("127.0.0.1")
+  .refine(
+    (value) => value === "localhost" || isIP(value) !== 0,
+    "HEALTH_HOST must be an IP address or localhost",
+  );
+
+const healthCacheSeconds = z
+  .string()
+  .trim()
+  .optional()
+  .default("15")
+  .refine((value) => /^\d+(\.\d+)?$/.test(value), "HEALTH_CACHE_SECONDS must be a non-negative number")
+  .transform((value) => Number(value))
+  .pipe(z.number().finite("HEALTH_CACHE_SECONDS must be a non-negative number"));
+
 const logLevel = z
   .string()
   .optional()
@@ -108,6 +139,8 @@ const EnvSchema = z.object({
   DATABASE_PATH: requiredNonEmpty("DATABASE_PATH").default("/data/gateway.db"),
   LOG_LEVEL: logLevel,
   HEALTH_PORT: healthPort,
+  HEALTH_HOST: healthHost,
+  HEALTH_CACHE_SECONDS: healthCacheSeconds,
   TZ: requiredNonEmpty("TZ").default("UTC"),
 });
 
@@ -122,12 +155,23 @@ export const CONFIG_ENV_KEYS = [
   "DATABASE_PATH",
   "LOG_LEVEL",
   "HEALTH_PORT",
+  "HEALTH_HOST",
+  "HEALTH_CACHE_SECONDS",
   "TZ",
 ] as const;
 
 /** Secret values the logger's redaction hook must never emit (architecture §9.2). */
 export function secretValues(config: GatewayConfig): readonly string[] {
-  return [config.telegramBotToken, config.openhandsApiKey];
+  // The bot token also appears percent-encoded (":" becomes "%3A") when it travels inside a URL
+  // such as an error message carrying the Bot API endpoint, so both forms are redacted.
+  const values = [config.telegramBotToken, config.openhandsApiKey];
+  for (const secret of [config.telegramBotToken, config.openhandsApiKey]) {
+    const encoded = encodeURIComponent(secret);
+    if (encoded !== secret) {
+      values.push(encoded);
+    }
+  }
+  return values;
 }
 
 /**
@@ -157,6 +201,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     databasePath: parsed.DATABASE_PATH,
     logLevel: parsed.LOG_LEVEL,
     healthPort: parsed.HEALTH_PORT,
+    healthHost: parsed.HEALTH_HOST,
+    healthCacheSeconds: parsed.HEALTH_CACHE_SECONDS,
     timezone: parsed.TZ,
   };
 }
