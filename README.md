@@ -41,6 +41,10 @@ resolves to a single value for the service, and that the Gateway's `OPENHANDS_AP
 effect until the owner pulls it and redeploys the stack in Coolify; nothing here changes the running
 instance automatically.
 
+**Possible client impact.** After the redeploy, any client that sends no key or a wrong
+`X-Session-API-Key` may start getting 401 from `agentcanvas`. The Gateway sends the key on every
+request.
+
 **How to revert.** Remove the `OH_SESSION_API_KEYS_0` entry from the `agentcanvas` service's
 `environment:` list and redeploy. No image, volume, other variable or Cloudflare Tunnel setting is
 affected.

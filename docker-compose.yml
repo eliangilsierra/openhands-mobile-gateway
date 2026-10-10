@@ -1,6 +1,7 @@
 services:
-  # Pre-existing service, reconstructed unchanged from architecture §4.1 (AC-12). This task
-  # only adds the `mobile-gateway` block below and the `gateway-state` volume.
+  # Pre-existing service: the owner's original configuration plus the single
+  # OH_SESSION_API_KEYS_0 entry (ADR-0007, see README.md). This task otherwise only adds the
+  # `mobile-gateway` block below and the `gateway-state` volume.
   agentcanvas:
     image: ghcr.io/openhands/agent-canvas:latest
     command: ["--public"]
