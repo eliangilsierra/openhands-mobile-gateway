@@ -4,13 +4,17 @@ import type { AddressInfo } from "node:net";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  closeHealthServer,
   createHealthService,
+  DEFAULT_PROBE_TIMEOUT_MS,
   startHealthServer,
   type ApiKeyStatus,
   type HealthReport,
   type HealthService,
   type TelegramHealthSource,
+  type TelegramStatus,
 } from "../src/health.js";
+import type { Logger } from "../src/logger.js";
 import { createOpenHandsRestClient, type OpenHandsRestClient } from "../src/openhands/rest.js";
 import { startMockOpenHandsServer, type MockOpenHandsServer } from "./mocks/openhands-server.js";
 
@@ -71,8 +75,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   for (const server of servers.splice(0)) {
-    server.closeAllConnections();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await closeHealthServer(server);
   }
   await mock.close();
   try {
@@ -224,6 +227,117 @@ describe("health service (unit)", () => {
   });
 });
 
+describe("probe timeout and logging", () => {
+  it("defaults the probe timeout below the Docker healthcheck (4 s)", () => {
+    expect(DEFAULT_PROBE_TIMEOUT_MS).toBe(4_000);
+  });
+
+  it("aborts the underlying requests when a probe times out", async () => {
+    const signals: AbortSignal[] = [];
+    const client: Pick<OpenHandsRestClient, "getServerInfo" | "countConversations"> = {
+      getServerInfo: (signal) => {
+        if (signal) {
+          signals.push(signal);
+        }
+        return new Promise(() => undefined);
+      },
+      countConversations: (signal) => {
+        if (signal) {
+          signals.push(signal);
+        }
+        return new Promise(() => undefined);
+      },
+    };
+    const report = await createHealthService({ db, client, version: "1", probeTimeoutMs: 50 }).check();
+    expect(report.openhands_api).toBe("unreachable");
+    expect(signals).toHaveLength(2);
+    expect(signals.every((signal) => signal.aborted)).toBe(true);
+  });
+
+  it("cancels the real request and does not retry after the abort", async () => {
+    mock.addRule({ method: "GET", path: "/server_info", hang: true });
+    const client = createOpenHandsRestClient({
+      baseUrl: mock.baseUrl,
+      apiKey: GOOD_KEY,
+      requestTimeoutMs: 60_000,
+      retry: { maxAttempts: 3, sleep: () => Promise.resolve() },
+    });
+    const report = await createHealthService({ db, client, version: "1", probeTimeoutMs: 100 }).check();
+    expect(report.openhands_api).toBe("unreachable");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(serverInfoCalls()).toBe(1);
+  });
+
+  it("logs degradation once and a recovery line when status returns to ok", async () => {
+    const lines: string[] = [];
+    const logger: Logger = {
+      debug: () => undefined,
+      info: (_msg, fields) => void lines.push(`info:${String(fields?.["event"])}`),
+      warn: (_msg, fields) => void lines.push(`warn:${String(fields?.["event"])}`),
+      error: () => undefined,
+    };
+    mock.addRule({ method: "GET", path: "/server_info", status: 503, times: 1 });
+    let clock = 0;
+    const service = createHealthService({
+      db,
+      client: makeClient(mock.baseUrl),
+      version: "1",
+      cacheSeconds: 1,
+      now: () => clock,
+      logger,
+    });
+    await service.check();
+    clock += 2_000;
+    await service.check();
+    clock += 2_000;
+    await service.check();
+    expect(lines).toEqual(["warn:health.degraded", "info:health.recovered"]);
+  });
+});
+
+describe("startHealthServer / closeHealthServer", () => {
+  it("binds to loopback unless a host is passed (SR-2)", async () => {
+    const service = createHealthService({ db, client: makeClient(mock.baseUrl), version: "1" });
+    const server = await startHealthServer(service, 0);
+    servers.push(server);
+    expect((server.address() as AddressInfo).address).toBe("127.0.0.1");
+  });
+
+  it("binds to an explicit host", async () => {
+    const service = createHealthService({ db, client: makeClient(mock.baseUrl), version: "1" });
+    const server = await startHealthServer(service, 0, { host: "0.0.0.0" });
+    servers.push(server);
+    expect((server.address() as AddressInfo).address).toBe("0.0.0.0");
+  });
+
+  it("keeps an error listener after listening and logs instead of throwing", async () => {
+    const events: string[] = [];
+    const logger: Logger = {
+      debug: () => undefined,
+      info: () => undefined,
+      warn: () => undefined,
+      error: (_msg, fields) => void events.push(String(fields?.["event"])),
+    };
+    const service = createHealthService({ db, client: makeClient(mock.baseUrl), version: "1" });
+    const server = await startHealthServer(service, 0, { logger });
+    servers.push(server);
+    expect(server.listenerCount("error")).toBeGreaterThan(0);
+    expect(() => server.emit("error", new Error("late"))).not.toThrow();
+    expect(events).toEqual(["health.server_error"]);
+  });
+
+  it("closeHealthServer stops listening, drops keep-alive connections and is idempotent", async () => {
+    const service = createHealthService({ db, client: makeClient(mock.baseUrl), version: "1" });
+    const server = await startHealthServer(service, 0);
+    const port = (server.address() as AddressInfo).port;
+    await fetch(`http://127.0.0.1:${port}/health`);
+    await closeHealthServer(server);
+    expect(server.listening).toBe(false);
+    await expect(closeHealthServer(server)).resolves.toBeUndefined();
+    await expect(fetch(`http://127.0.0.1:${port}/health`)).rejects.toThrow();
+  });
+});
+
 describe("GET /health (integration)", () => {
   it("answers 200 with the documented shape when everything is up (T-AC-1)", async () => {
     const base = await listen(
@@ -281,6 +395,24 @@ describe("GET /health (integration)", () => {
     // Cover the success, wrong-key and refused-connection paths.
     const services: HealthService[] = [
       createHealthService({ db, client: makeClient(mock.baseUrl), version: "1", telegram: telegram("connected") }),
+      // A misbehaving adapter that hands back a secret-like value or throws with one in its message.
+      createHealthService({
+        db,
+        client: makeClient(mock.baseUrl),
+        version: "1",
+        // Cast on purpose: simulates an adapter breaking its contract at runtime.
+        telegram: { status: () => TG_VALUE as unknown as TelegramStatus },
+      }),
+      createHealthService({
+        db,
+        client: makeClient(mock.baseUrl),
+        version: "1",
+        telegram: {
+          status: () => {
+            throw new Error(TG_VALUE);
+          },
+        },
+      }),
       createHealthService({ db, client: makeClient(mock.baseUrl, BAD_KEY), version: "1" }),
       createHealthService({ db, client: makeClient(await unreachableBaseUrl()), version: "1" }),
     ];
@@ -294,6 +426,8 @@ describe("GET /health (integration)", () => {
       expect(text).not.toContain("chat");
       expect(text).not.toContain("127.0.0.1");
     }
+    const injected = await get(await listen(services[1] as HealthService));
+    expect((JSON.parse(injected.text) as HealthReport).telegram).toBe("unknown");
     // Only the documented keys appear.
     const first = services[0] as HealthService;
     const body = JSON.parse((await get(await listen(first))).text) as HealthReport;

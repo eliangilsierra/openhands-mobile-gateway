@@ -497,8 +497,9 @@ describe("T-AC-5: all HTTP access lives in src/openhands/rest.ts", () => {
   it.each([
     ["the OpenHands client package", /@openhands\/typescript-client/, []],
     ["fetch()", /\bfetch\s*\(/, []],
-    // src/health.ts only *listens* (GET /health); it makes no outbound call, so it may import it.
-    ["node:http(s)", /from\s+["'](?:node:)?https?["']/, ["src/health.ts"]],
+    // src/health.ts only *listens* (GET /health); it may import node:http, and the dedicated test
+    // below pins that it makes no outbound call. Matches static, bare, dynamic and require forms.
+    ["node:http(s)", /\b(?:from|import|require)\s*\(?\s*["'](?:node:)?https?["']/, ["src/health.ts"]],
     ["the session key header", /X-Session-API-Key/i, []],
     ["undici/axios/got", /from\s+["'](?:undici|axios|got|node-fetch)["']/, []],
   ] as const)("no other module uses %s", (_label, pattern, exempt) => {
@@ -507,6 +508,15 @@ describe("T-AC-5: all HTTP access lives in src/openhands/rest.ts", () => {
       .map((file) => relative(process.cwd(), file).split(sep).join("/"))
       .filter((file) => !(exempt as readonly string[]).includes(file));
     expect(offenders).toEqual([]);
+  });
+
+  it("src/health.ts only listens: no outbound http calls and no node:https or node:net", () => {
+    const text = readFileSync(join(srcRoot, "health.ts"), "utf-8");
+    expect(text).not.toMatch(/\bhttps?\.(?:request|get)\s*\(/);
+    expect(text).not.toMatch(/\brequest\s*\(/);
+    expect(text).not.toMatch(/\bconnect\s*\(/);
+    expect(text).not.toMatch(/\b(?:from|import|require)\s*\(?\s*["'](?:node:)?https["']/);
+    expect(text).not.toMatch(/\b(?:from|import|require)\s*\(?\s*["'](?:node:)?net["']/);
   });
 
   it("rest.ts never imports the LLM subpaths or the package root (T-B4-2)", () => {

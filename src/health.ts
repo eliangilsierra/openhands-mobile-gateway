@@ -13,7 +13,8 @@ import type { OpenHandsRestClient } from "./openhands/rest.js";
  */
 
 export const DEFAULT_HEALTH_CACHE_SECONDS = 15;
-export const DEFAULT_PROBE_TIMEOUT_MS = 5_000;
+export const DEFAULT_HEALTH_HOST = "127.0.0.1";
+export const DEFAULT_PROBE_TIMEOUT_MS = 4_000;
 
 export type TelegramStatus = "connected" | "disconnected" | "unknown";
 export type ApiKeyStatus = "accepted" | "rejected" | "unknown";
@@ -73,15 +74,18 @@ class ProbeTimeoutError extends Error {
   }
 }
 
-async function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
+/** Runs `work` with a signal that is aborted after `ms`, so the underlying request is cancelled too. */
+async function withTimeout<T>(work: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
+  const controller = new AbortController();
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
+      controller.abort();
       reject(new ProbeTimeoutError());
     }, ms);
   });
   try {
-    return await Promise.race([work, timeout]);
+    return await Promise.race([work(controller.signal), timeout]);
   } finally {
     clearTimeout(timer);
   }
@@ -119,7 +123,7 @@ export function createHealthService(options: HealthServiceOptions): HealthServic
 
   async function probeApiKey(): Promise<ApiKeyStatus> {
     try {
-      await withTimeout(options.client.countConversations(), probeTimeoutMs);
+      await withTimeout((signal) => options.client.countConversations(signal), probeTimeoutMs);
       return "accepted";
     } catch (error) {
       return error instanceof AuthError ? "rejected" : "unknown";
@@ -132,7 +136,7 @@ export function createHealthService(options: HealthServiceOptions): HealthServic
     const keyProbe = probeApiKey();
     let api: OpenHandsApiStatus;
     try {
-      await withTimeout(options.client.getServerInfo(), probeTimeoutMs);
+      await withTimeout((signal) => options.client.getServerInfo(signal), probeTimeoutMs);
       api = "reachable";
     } catch {
       api = "unreachable";
@@ -170,6 +174,9 @@ export function createHealthService(options: HealthServiceOptions): HealthServic
           openhands_api: probe.api,
           api_key: probe.apiKey,
         });
+      }
+      if (status === "ok" && lastStatus === "degraded") {
+        options.logger?.info("Health recovered", { event: "health.recovered" });
       }
       lastStatus = status;
       return {
@@ -229,7 +236,11 @@ export function createHealthServer(service: HealthService, logger?: Logger): Ser
   });
 }
 
-/** Binds the server (default `0.0.0.0`, per §7.7) and resolves once it is listening. */
+/**
+ * Binds the server and resolves once it is listening. The host defaults to loopback (SR-2): the
+ * caller must pass `0.0.0.0` explicitly to be reachable from the Docker network (§7.7). A late
+ * `error` event is logged instead of crashing the process.
+ */
 export async function startHealthServer(
   service: HealthService,
   port: number,
@@ -238,11 +249,28 @@ export async function startHealthServer(
   const server = createHealthServer(service, options.logger);
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(port, options.host ?? "0.0.0.0", () => {
+    server.listen(port, options.host ?? DEFAULT_HEALTH_HOST, () => {
       server.off("error", reject);
       resolve();
     });
   });
+  server.on("error", (error: Error) => {
+    options.logger?.error("Health server error", { event: "health.server_error", err_type: error.name });
+  });
   options.logger?.info("Health endpoint listening", { event: "health.listening" });
   return server;
+}
+
+/** Stops accepting connections, drops idle/keep-alive ones and resolves once the server is closed. */
+export function closeHealthServer(server: Server): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error !== undefined && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+    server.closeAllConnections();
+  });
 }
