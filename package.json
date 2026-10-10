@@ -17,6 +17,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "grammy": "^1.46.0",
     "zod": "^4.6.5"
   },
   "devDependencies": {
