@@ -6,44 +6,43 @@ for the full architecture and [docs/decisions/](docs/decisions/) for the Accepte
 
 ## Security note: preventive mitigation of OpenHands/OpenHands #17763
 
-`docker-compose.yml`'s `agentcanvas` service's `environment:` block sets one extra variable:
+The `agentcanvas` service's `environment:` list in `docker-compose.yml` has one extra entry:
 
 ```yaml
-OH_SESSION_API_KEYS_0: ${SERVICE_PASSWORD_64_CANVASKEY}
+- OH_SESSION_API_KEYS_0=${SERVICE_PASSWORD_64_CANVASKEY}
 ```
 
 **Why it is there.** [ADR-0007](docs/decisions/ADR-0007-agentcanvas-auth-trust-boundary.md)
-documents an upstream defect,
-[OpenHands/OpenHands#17763](https://github.com/OpenHands/OpenHands/issues/17763): when
-`agentcanvas`'s `session_api_keys` list is empty, its `X-Session-API-Key` check becomes a no-op and
-`/api/*` accepts any request on the Docker network, regardless of the key sent. ADR-0007 §6 names
-`OH_SESSION_API_KEYS_0` (same value as `LOCAL_BACKEND_API_KEY`) as the one-line fix, but marks it as
-"the person's call, outside the Gateway's scope" because it is a change to `agentcanvas`, which
-FR-10/AC-12 forbid the Gateway's own design from making.
+describes an upstream defect,
+[OpenHands/OpenHands#17763](https://github.com/OpenHands/OpenHands/issues/17763). If it affects this
+deployment, then when `agentcanvas`'s `session_api_keys` list is empty, its `X-Session-API-Key`
+check may become a no-op and `/api/*` may accept requests on the Docker network regardless of the
+key sent. Whether this deployment is affected has not been established. ADR-0007 section 6 names
+`OH_SESSION_API_KEYS_0` as a possible remediation, but leaves it to the owner because it changes
+`agentcanvas`, which FR-10/AC-12 keep out of the Gateway's design.
 
-The project owner reviewed this trade-off and, in the "Decision recorded" comment on
-[Issue #1](https://github.com/eliangilsierra/openhands-mobile-gateway/issues/1#issuecomment-6071438525),
-explicitly declined to run the ADR-0007 §5 read-only verification commands against the live VPS and
-instead directed the team to "assume the #17763 defect may be live (worst case) and apply the
-recommended remediation preventively, rather than leaving the risk accepted as unquantified." This
-line is that preventive remediation, added as a deliberate, explicitly human-authorized **exception**
-to the general "never modify `agentcanvas`" rule — scoped to exactly this one environment variable,
-not a precedent for any other change to that service.
+The project owner recorded the decision in a
+[comment on Issue #1](https://github.com/eliangilsierra/openhands-mobile-gateway/issues/1#issuecomment-6071438525):
+not to run the ADR-0007 section 5 read-only verification commands against the live VPS, and to
+assume the defect may be live and apply a mitigation preventively. This entry is that mitigation. It
+is an explicit, owner-authorized exception to the rule of not modifying `agentcanvas`, limited to
+this one environment variable and not a precedent for other changes to that service.
 
-**This is not a confirmed fix.** Whether the #17763-class defect was actually live on this
-deployment, and whether this line resolves it in practice, has **not been verified** against the
-running VPS — the agent team has no network path to it, and the owner explicitly chose not to run
-the verification commands. Treat this as a precaution applied under uncertainty, not as evidence
-that a vulnerability existed or that it is now closed.
+**Status: preventive mitigation, not a fix.** Nothing was verified against the running VPS (the
+agent team has no network path to it), so there is no evidence that the defect exists here or that
+this entry resolves it. Do not describe the issue as fixed or closed.
 
-**How it takes effect.** This repository's `docker-compose.yml` is the source of truth the owner
-redeploys from via Coolify. The line above only takes effect once the owner pulls and redeploys this
-file on the VPS; nothing in this repository applies it automatically to the running instance.
+**Same key as the Gateway.** `OH_SESSION_API_KEYS_0` and `LOCAL_BACKEND_API_KEY` both reference
+`${SERVICE_PASSWORD_64_CANVASKEY}` in this file, so they resolve to the same value. That holds only
+while both lines keep using that variable. The owner should confirm in Coolify that this variable
+resolves to a single value for the service, and that the Gateway's `OPENHANDS_API_KEY` uses it too.
 
-**How to revert.** Remove the `OH_SESSION_API_KEYS_0` line from the `agentcanvas` service's
-`environment:` block and redeploy. Nothing else needs to change: `agentcanvas` behaves exactly as it
-did before this line was added — no image, volume, other environment variable, or Cloudflare Tunnel
-configuration is affected by adding or removing it.
+**When it takes effect.** This file is what the owner redeploys from via Coolify. The entry has no
+effect until the owner pulls it and redeploys the stack in Coolify; nothing here changes the running
+instance automatically.
 
-See also: [ADR-0007](docs/decisions/ADR-0007-agentcanvas-auth-trust-boundary.md) and the
-[coordinator's decision comment on Issue #1](https://github.com/eliangilsierra/openhands-mobile-gateway/issues/1#issuecomment-6071438525).
+**How to revert.** Remove the `OH_SESSION_API_KEYS_0` entry from the `agentcanvas` service's
+`environment:` list and redeploy. No image, volume, other variable or Cloudflare Tunnel setting is
+affected.
+
+See also: [ADR-0007](docs/decisions/ADR-0007-agentcanvas-auth-trust-boundary.md).
