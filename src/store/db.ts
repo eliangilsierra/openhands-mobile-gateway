@@ -64,6 +64,10 @@ function assertQuickCheckOk(db: DatabaseSync, logger: Logger): void {
  * already existing parent directory is left as the operator configured it.
  */
 function prepareDatabaseFile(databasePath: string): void {
+  // In-memory (":memory:"), empty (temporary) and URI ("file:...") targets are not plain files.
+  if (databasePath === "" || databasePath === ":memory:" || databasePath.startsWith("file:")) {
+    return;
+  }
   mkdirSync(dirname(databasePath), { recursive: true, mode: 0o700 });
   closeSync(openSync(databasePath, "a", 0o600));
   for (const suffix of ["", "-wal", "-shm"]) {

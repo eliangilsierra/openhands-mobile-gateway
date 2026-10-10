@@ -1,4 +1,4 @@
-import { statSync, writeFileSync } from "node:fs";
+import { existsSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -342,6 +342,21 @@ describe("busy detection with extended result codes", () => {
       }),
     ).toThrow("unique");
     expect(calls).toBe(1);
+  });
+});
+
+describe("in-memory database", () => {
+  it("opens :memory: without creating a file in the working directory", () => {
+    const mem = openStore({ databasePath: ":memory:", logger });
+    try {
+      expect(existsSync(":memory:")).toBe(false);
+      expect(existsSync(join(process.cwd(), ":memory:"))).toBe(false);
+      const repo = new ChatStateRepository(mem, logger);
+      repo.setActiveProject("telegram", "1", "alpha");
+      expect(repo.getActiveProject("telegram", "1")).toBe("alpha");
+    } finally {
+      closeStore(mem);
+    }
   });
 });
 
