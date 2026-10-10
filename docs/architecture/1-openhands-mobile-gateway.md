@@ -92,8 +92,12 @@ Ubuntu VPS + Coolify
 └── Docker Compose project
     ├── agentcanvas   image ghcr.io/openhands/agent-canvas:latest, command ["--public"]
     │                 expose: 8000 (no ports: mapping → not reachable from the host or Internet)
-    │                 env: PORT=8000, LOCAL_BACKEND_API_KEY, OH_SECRET_KEY,
+    │                 env: PORT=8000,
+    │                      LOCAL_BACKEND_API_KEY=${SERVICE_PASSWORD_64_CANVASKEY},
+    │                      OH_SECRET_KEY=${SERVICE_PASSWORD_64_OHSECRET},
     │                      AGENT_CANVAS_DISABLE_TELEMETRY=true
+    │                 (SERVICE_PASSWORD_64_* are Coolify's auto-generated host-side variable
+    │                  names; LOCAL_BACKEND_API_KEY/OH_SECRET_KEY are the container-side names)
     │                 volumes: canvas-state:/home/openhands/.openhands,
     │                          claude-home:/home/openhands/.claude,
     │                          npm-cache:/home/openhands/.npm,
