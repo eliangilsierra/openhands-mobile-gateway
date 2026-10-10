@@ -52,7 +52,8 @@ import type {
  * other non-2xx and malformed 2xx JSON -> UnexpectedResponseError (never retried).
  * Only GET calls are retried (exponential backoff with jitter); POSTs never are, in
  * particular `POST .../events`, which would duplicate a task. A POST that fails without a
- * response has `outcomeUnknown === true`: the server may have processed it.
+ * response, or that ends in 502/504, has `outcomeUnknown === true`: the server (or a proxy in
+ * front of it) may have processed it.
  *
  * Timeouts: one per-request timeout (`requestTimeoutMs`, 30 s) bounds the whole request;
  * there is no separate connect timeout (accepted deviation, see the PR). The package
@@ -131,6 +132,10 @@ function pathId(id: string): string {
 
 /** SR-3: only http/https base URLs; returned without a trailing slash. */
 function parseBaseUrl(value: string): string {
+  // A bare `?` or `#` leaves URL.search/hash empty, so check the raw string as well.
+  if (/[?#]/.test(value)) {
+    throw new TypeError("OPENHANDS_BASE_URL must not contain a query or fragment");
+  }
   let url: URL;
   try {
     url = new URL(value);

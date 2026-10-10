@@ -375,7 +375,7 @@ describe("SR-3: base URL scheme", () => {
     },
   );
 
-  it.each(["http://u:p@h", "http://h/?a=1", "http://h/#f", "http://u@h/"])(
+  it.each(["http://u:p@h", "http://h/?a=1", "http://h/#f", "http://u@h/", "http://h/?", "http://h/#", "http://h/x?"])(
     "refuses credentials, query or fragment: %s",
     (baseUrl) => {
       expect(() => createOpenHandsRestClient({ baseUrl, apiKey: KEY })).toThrow(TypeError);
