@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ConfigError, loadConfig, secretValues } from "./config.js";
+import { ConfigError, loadConfig, secretValues } from "../src/config.js";
 
 const VALID_ENV = {
   OPENHANDS_BASE_URL: "http://agentcanvas:8000",
@@ -27,6 +27,8 @@ describe("loadConfig", () => {
       databasePath: "/data/gateway.db",
       logLevel: "debug",
       healthPort: 9090,
+      healthHost: "127.0.0.1",
+      healthCacheSeconds: 15,
       timezone: "Europe/Madrid",
     });
   });
@@ -124,5 +126,57 @@ describe("secretValues", () => {
     const config = loadConfig({ ...VALID_ENV });
 
     expect(secretValues(config)).toEqual(["telegram-secret-token", "canvas-secret-key"]);
+  });
+
+  it("also lists the URL-encoded form of a token that contains reserved characters", () => {
+    const config = loadConfig({ ...VALID_ENV, TELEGRAM_BOT_TOKEN: "123456:ABC-def_ghi" });
+
+    expect(secretValues(config)).toContain("123456:ABC-def_ghi");
+    expect(secretValues(config)).toContain("123456%3AABC-def_ghi");
+  });
+});
+
+describe("TELEGRAM_ALLOWED_USER_IDS bounds", () => {
+  it.each(["0", "-5", "111,0", "9007199254740992", "99999999999999999999", "1.5", "abc"])(
+    "rejects %s",
+    (value) => {
+      expect(() => loadConfig({ ...VALID_ENV, TELEGRAM_ALLOWED_USER_IDS: value })).toThrow(ConfigError);
+    },
+  );
+
+  it("accepts the largest safe integer", () => {
+    const config = loadConfig({ ...VALID_ENV, TELEGRAM_ALLOWED_USER_IDS: String(Number.MAX_SAFE_INTEGER) });
+
+    expect(config.telegramAllowedUserIds).toEqual([Number.MAX_SAFE_INTEGER]);
+  });
+
+  it("does not echo the offending value in the error", () => {
+    expect(() => loadConfig({ ...VALID_ENV, TELEGRAM_ALLOWED_USER_IDS: "99999999999999999999" })).toThrow(
+      /^(?!.*99999999999999999999)/,
+    );
+  });
+});
+
+describe("health settings", () => {
+  it("defaults to loopback and a 15 s cache", () => {
+    const { HEALTH_PORT: _port, ...rest } = VALID_ENV;
+    const config = loadConfig(rest);
+
+    expect(config.healthHost).toBe("127.0.0.1");
+    expect(config.healthCacheSeconds).toBe(15);
+  });
+
+  it("accepts an explicit host and a zero or fractional cache", () => {
+    expect(loadConfig({ ...VALID_ENV, HEALTH_HOST: "0.0.0.0" }).healthHost).toBe("0.0.0.0");
+    expect(loadConfig({ ...VALID_ENV, HEALTH_CACHE_SECONDS: "0" }).healthCacheSeconds).toBe(0);
+    expect(loadConfig({ ...VALID_ENV, HEALTH_CACHE_SECONDS: "2.5" }).healthCacheSeconds).toBe(2.5);
+  });
+
+  it.each(["-1", "abc", "", "1e3", "Infinity", "NaN"])("rejects HEALTH_CACHE_SECONDS=%j", (value) => {
+    expect(() => loadConfig({ ...VALID_ENV, HEALTH_CACHE_SECONDS: value })).toThrow(ConfigError);
+  });
+
+  it.each(["not a host", "", "example.com;x"])("rejects HEALTH_HOST=%j", (value) => {
+    expect(() => loadConfig({ ...VALID_ENV, HEALTH_HOST: value })).toThrow(ConfigError);
   });
 });
