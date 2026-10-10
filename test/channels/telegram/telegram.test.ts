@@ -1,4 +1,5 @@
 import { HttpError } from "grammy";
+import type { UserFromGetMe } from "grammy/types";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   ALLOWED_UPDATES,
@@ -21,13 +22,22 @@ import { TelegramStatus } from "../../../src/channels/telegram/status.js";
 import { ChatStateRepository } from "../../../src/store/chat-state.js";
 import { closeStore, openStore } from "../../../src/store/db.js";
 import { createRecordingLogger, createTempDbPath } from "../../store/helpers.js";
-import { BOT_INFO, installFakeApi, messageUpdate, type ApiCall, type ApiResult } from "./helpers.js";
+import { BOT_INFO as BASE_BOT_INFO, installFakeApi, messageUpdate, type ApiCall, type ApiResult } from "./helpers.js";
 import type { DatabaseSync } from "node:sqlite";
 
 const ALLOWED = 1001;
 const STRANGER = 9999;
 const TOKEN = "123456:TEST-TOKEN-NOT-REAL";
 const SALT = "test-salt";
+
+/** Bot info typed against grammY `UserFromGetMe`, which requires more fields than the shared helper sets. */
+const BOT_INFO: UserFromGetMe = {
+  ...BASE_BOT_INFO,
+  has_topics_enabled: false,
+  allows_users_to_create_topics: false,
+  can_manage_bots: false,
+  supports_join_request_queries: false,
+};
 
 let db: DatabaseSync;
 let cleanup: () => void;
@@ -47,7 +57,7 @@ afterEach(() => {
   cleanup();
 });
 
-function build(respond?: (call: ApiCall) => ApiResult) {
+function build(respond?: (call: ApiCall) => ApiResult | Promise<ApiResult>) {
   const bot = createBot({
     token: TOKEN,
     allowedUserIds: new Set([ALLOWED]),
@@ -122,7 +132,7 @@ describe("allowlist middleware", () => {
 
   it("rejects update kinds outside message/callback_query, even from an allowed user", async () => {
     const { poller, calls } = build();
-    await poller.handle({ update_id: 6, edited_message: messageUpdate(6, ALLOWED, "x").message! });
+    await poller.handle({ update_id: 6, edited_message: { ...messageUpdate(6, ALLOWED, "x").message!, edit_date: 1 } });
     expect(sends(calls)[0]?.payload["text"]).toBe(UNAUTHORIZED_TEXT);
     expect(logger.records.some((r) => r.fields?.["event"] === "telegram.update.rejected")).toBe(true);
   });
