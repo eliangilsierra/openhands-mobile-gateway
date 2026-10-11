@@ -6,6 +6,7 @@ import { allowlistMiddleware } from "../../../src/channels/telegram/middleware/a
 import {
   ACK_TEXT,
   NO_PROJECT_TEXT,
+  OUTCOME_UNKNOWN_TEXT,
   RECREATED_TEXT,
   registerText,
   tooLongText,
@@ -138,6 +139,14 @@ describe("free-text handler", () => {
     await bot.handleUpdate(messageUpdate(2, USER, "segundo"));
     expect(replies(calls).at(-1)).toBe(RECREATED_TEXT);
     expect(bindings.findActive("telegram", CHAT, "alpha")?.conversationId).toBe("fresh");
+  });
+
+  it("L2: warns that the task may have arrived when the outcome is unknown", async () => {
+    chatState.setActiveProject("telegram", CHAT, "alpha");
+    server.addRule({ method: "POST", path: "/api/conversations", status: 504, times: 1 });
+    const { bot, calls } = build();
+    await bot.handleUpdate(messageUpdate(1, USER, "hola"));
+    expect(replies(calls)).toEqual([ACK_TEXT, OUTCOME_UNKNOWN_TEXT]);
   });
 
   it("never lets text from an unauthorised user reach the session code", async () => {

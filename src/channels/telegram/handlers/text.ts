@@ -13,6 +13,9 @@ export const RUNNING_TEXT = "⏳ OpenHands ya está ejecutando una tarea en esta
 export const RECREATED_TEXT =
   "⚠️ La conversación anterior ya no existe en OpenHands; se perdió el historial. Se creó una nueva con tu mensaje.";
 
+export const OUTCOME_UNKNOWN_TEXT =
+  "⚠️ No pude confirmar si OpenHands recibió tu tarea. Puede que ya esté en ejecución: revisa antes de reenviarla para no duplicarla.";
+
 export function tooLongText(max: number): string {
   return `⚠️ El mensaje es demasiado largo (máximo ${String(max)} caracteres).`;
 }
@@ -39,6 +42,8 @@ export function replyForResult(result: SubmitTaskResult): string | null {
       return AUTH_TEXT;
     case "already_running":
       return RUNNING_TEXT;
+    case "outcome_unknown":
+      return OUTCOME_UNKNOWN_TEXT;
     case "error":
       return ERROR_TEXT;
   }

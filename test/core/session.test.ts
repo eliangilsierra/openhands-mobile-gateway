@@ -164,6 +164,8 @@ describe("submitTask", () => {
       ["401", new AuthError({ ...ctx, status: 401 }), "auth_error"],
       ["409", new ConflictError({ ...ctx, status: 409 }), "already_running"],
       ["503", new UnavailableError({ ...ctx, status: 503 }), "unavailable"],
+      ["504", new UnavailableError({ ...ctx, status: 504 }), "outcome_unknown"],
+      ["no response", new UnavailableError(ctx), "outcome_unknown"],
       ["other", new TypeError("boom"), "error"],
     ] as const;
 
@@ -197,6 +199,93 @@ describe("submitTask", () => {
       chatState.setActiveProject("telegram", "42", "alpha");
       const unavailable = { ...deps, registry: { resolve: () => Promise.resolve({ status: "unavailable" as const }) } };
       expect(await submitTask(unavailable, TARGET, TASK, noAck)).toEqual({ status: "unavailable" });
+    });
+  });
+
+  describe("review fixes", () => {
+    async function bindFirst(): Promise<void> {
+      chatState.setActiveProject("telegram", "42", "alpha");
+      await submitTask(deps, TARGET, TASK, noAck);
+      server.requests.length = 0;
+      server.addRule({ method: "POST", path: `/api/conversations/${CONVERSATION_ID}/events`, status: 404, times: 1 });
+    }
+    const registryWith = (projectsRoot: string, staticProjects: string[]): SubmitTaskDeps => ({
+      ...deps,
+      registry: new ProjectRegistry({ projectsRoot, staticProjects, client: deps.client as never }),
+    });
+
+    it("O1: a 404 for a project removed from the registry creates nothing and keeps the old binding", async () => {
+      await bindFirst();
+      const result = await submitTask(registryWith("/projects", ["beta"]), TARGET, "sigue", noAck);
+      expect(result).toEqual({ status: "project_not_found" });
+      expect(posts("/api/conversations")).toHaveLength(0);
+      expect(bindings.findActive("telegram", "42", "alpha")?.conversationId).toBe(CONVERSATION_ID);
+    });
+
+    it("O1: a 404 for a re-pointed project uses the resolved working_dir, not the stored one", async () => {
+      await bindFirst();
+      server.addRule({ method: "POST", path: "/api/conversations", status: 201, body: { id: "moved" }, times: 1 });
+      const result = await submitTask(registryWith("/other", ["alpha"]), TARGET, "sigue", noAck);
+      expect(result).toEqual({ status: "recreated" });
+      expect(posts("/api/conversations")[0]?.body).toEqual({
+        workspace: { working_dir: "/other/alpha" },
+        initial_message: "sigue",
+      });
+      expect(bindings.findActive("telegram", "42", "alpha")?.workingDir).toBe("/other/alpha");
+    });
+
+    it("M2: a failing touchLastUsed still reports sent and logs only the event and error type", async () => {
+      chatState.setActiveProject("telegram", "42", "alpha");
+      await submitTask(deps, TARGET, TASK, noAck);
+      const touch = vi.spyOn(bindings, "touchLastUsed").mockImplementation(() => {
+        throw new Error("database is locked /secret/path");
+      });
+      expect(await submitTask(deps, TARGET, "otro", noAck)).toEqual({ status: "sent" });
+      expect(touch).toHaveBeenCalledTimes(1);
+      expect(logger.records.some((r) => r.fields?.["event"] === "session.touch_failed")).toBe(true);
+      expect(JSON.stringify(logger.records)).not.toContain("/secret/path");
+    });
+
+    it("M1: concurrent submissions for the same chat and project create a single conversation", async () => {
+      chatState.setActiveProject("telegram", "42", "alpha");
+      const results = await Promise.all([
+        submitTask(deps, TARGET, "uno", noAck),
+        submitTask(deps, TARGET, "dos", noAck),
+      ]);
+      expect(results.map((r) => r.status).sort()).toEqual(["created", "sent"]);
+      expect(posts("/api/conversations")).toHaveLength(1);
+      expect(posts(`/api/conversations/${CONVERSATION_ID}/events`)).toHaveLength(1);
+    });
+
+    it("M1: a failure binding a created conversation is outcome_unknown and logs the orphan id", async () => {
+      chatState.setActiveProject("telegram", "42", "alpha");
+      vi.spyOn(bindings, "create").mockImplementation(() => {
+        throw new Error("SQLITE_BUSY");
+      });
+      expect(await submitTask(deps, TARGET, TASK, noAck)).toEqual({ status: "outcome_unknown" });
+      const record = logger.records.find((r) => r.fields?.["event"] === "session.bind_failed");
+      expect(record?.level).toBe("error");
+      expect(record?.fields?.["conversation_id"]).toBe(CONVERSATION_ID);
+      expect(JSON.stringify(logger.records)).not.toContain(TASK);
+    });
+
+    it("L1: a 404 followed by a 503 leaves the binding active so the next message still reports the loss", async () => {
+      await bindFirst();
+      server.addRule({ method: "POST", path: "/api/conversations", status: 503, times: 1 });
+      expect(await submitTask(deps, TARGET, "sigue", noAck)).toEqual({ status: "unavailable" });
+      expect(bindings.findActive("telegram", "42", "alpha")?.conversationId).toBe(CONVERSATION_ID);
+
+      server.addRule({ method: "POST", path: `/api/conversations/${CONVERSATION_ID}/events`, status: 404, times: 1 });
+      server.addRule({ method: "POST", path: "/api/conversations", status: 201, body: { id: "fresh" }, times: 1 });
+      expect(await submitTask(deps, TARGET, "sigue", noAck)).toEqual({ status: "recreated" });
+    });
+
+    it("L2: a 504 on create is outcome_unknown, a 503 is a clean unavailable", async () => {
+      chatState.setActiveProject("telegram", "42", "alpha");
+      server.addRule({ method: "POST", path: "/api/conversations", status: 504, times: 1 });
+      expect(await submitTask(deps, TARGET, TASK, noAck)).toEqual({ status: "outcome_unknown" });
+      server.addRule({ method: "POST", path: "/api/conversations", status: 503, times: 1 });
+      expect(await submitTask(deps, TARGET, TASK, noAck)).toEqual({ status: "unavailable" });
     });
   });
 
