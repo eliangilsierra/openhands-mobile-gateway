@@ -60,15 +60,74 @@ const SECRET_PATTERNS: readonly RegExp[] = [
   /\b(?:api[_-]?key|token|secret|password|passwd|authorization)\s*[=:]\s*\S+/gi,
   /\bAKIA[0-9A-Z]{16}\b/g,
 ];
-// C0/C1 controls, DEL, bidi overrides/isolates, zero-width and line/paragraph separators.
+// Invisible formatting characters (zero-width, bidi marks/overrides/isolates, BOM, soft hyphen):
+// replaced by a space; the joined-text check in sanitizeDetail catches secrets split by them.
+const INVISIBLE_CHARS = /[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g;
+// C0/C1 controls, DEL and line/paragraph separators: replaced by a space.
 // eslint-disable-next-line no-control-regex
-const UNSAFE_CHARS = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]/g;
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
+
+function redact(text: string): string {
+  let out = text;
+  for (const pattern of SECRET_PATTERNS) out = out.replace(pattern, REDACTED);
+  return out;
+}
+
+// Same patterns without the leading word boundary: boundaries are checked on the original text.
+const JOINED_PATTERNS: readonly RegExp[] = SECRET_PATTERNS.map(
+  (p) => new RegExp(p.source.replace(/^\\b/, ""), p.flags),
+);
+const HIDING_CHARS = new RegExp(`${INVISIBLE_CHARS.source}|${CONTROL_CHARS.source}`);
+
+/**
+ * Redacts secrets that were split by invisible characters, controls or line breaks: the pieces are
+ * rejoined only to find the secret, and the whole original span (separators included) is replaced.
+ */
+function redactSplitSecrets(value: string): string {
+  const joined: string[] = [];
+  const origin: number[] = []; // index in `value` of each char kept in `joined`
+  const chars = Array.from(value);
+  let offset = 0;
+  const starts: number[] = [];
+  for (const ch of chars) {
+    starts.push(offset);
+    if (!HIDING_CHARS.test(ch)) {
+      joined.push(ch);
+      origin.push(offset);
+    }
+    offset += ch.length;
+  }
+  const text = joined.join("");
+  const ranges: Array<[number, number]> = [];
+  for (const pattern of JOINED_PATTERNS) {
+    for (const m of text.matchAll(pattern)) {
+      const from = origin[Array.from(text.slice(0, m.index)).length];
+      const lastChar = origin[Array.from(text.slice(0, m.index + m[0].length)).length - 1];
+      if (from === undefined || lastChar === undefined) continue;
+      const to = lastChar + 1;
+      const prev = value.slice(0, from).replace(new RegExp(`(?:${HIDING_CHARS.source})+$`), "").slice(-1);
+      const spansHidden = Array.from(value.slice(from, to)).some((c) => HIDING_CHARS.test(c));
+      if (spansHidden && !/\w/.test(prev)) ranges.push([from, to]);
+    }
+  }
+  ranges.sort((x, y) => y[0] - x[0]);
+  let out = value;
+  let limit = Infinity;
+  for (const [from, to] of ranges) {
+    if (to > limit) continue; // overlaps a range already replaced
+    out = `${out.slice(0, from)}${REDACTED}${out.slice(to)}`;
+    limit = from;
+  }
+  return out;
+}
 
 /** Makes untrusted text safe to embed in a one-line notification. */
 export function sanitizeDetail(value: string, maxLength: number = MAX_DETAIL_LENGTH): string {
-  let text = value;
-  for (const pattern of SECRET_PATTERNS) text = text.replace(pattern, REDACTED);
-  text = text.replace(UNSAFE_CHARS, " ").replace(/\s+/g, " ").trim();
+  // Redact BEFORE cleaning so invisible characters and line breaks cannot hide a secret.
+  const stripped = redactSplitSecrets(value);
+  const text = redact(
+    stripped.replace(INVISIBLE_CHARS, " ").replace(CONTROL_CHARS, " ").replace(/\s+/g, " ").trim(),
+  );
   const chars = Array.from(text);
   return chars.length > maxLength ? `${chars.slice(0, maxLength - 1).join("")}…` : text;
 }
@@ -168,18 +227,26 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
   Condensation: () => [],
 };
 
+const SUPPRESSED_MALFORMED: TranslationResult = {
+  notifications: [],
+  classification: "event.suppressed",
+  reason: "malformed_event",
+};
+
 /** Translates one event. Never throws: malformed or unknown events are suppressed. */
 export function translateWithClassification(event: OpenHandsEvent): TranslationResult {
-  const kind = typeof event.kind === "string" ? event.kind : "";
-  const handler = Object.hasOwn(HANDLERS, kind) ? HANDLERS[kind] : undefined;
-  if (handler === undefined) {
-    return { notifications: [], classification: "event.suppressed", reason: "unknown_kind" };
-  }
+  if (typeof event !== "object" || event === null) return SUPPRESSED_MALFORMED;
+  let kind: string;
   let notifications: Notification[];
   try {
+    kind = typeof event.kind === "string" ? event.kind : "";
+    const handler = Object.hasOwn(HANDLERS, kind) ? HANDLERS[kind] : undefined;
+    if (handler === undefined) {
+      return { notifications: [], classification: "event.suppressed", reason: "unknown_kind" };
+    }
     notifications = handler(event);
   } catch {
-    return { notifications: [], classification: "event.suppressed", reason: "malformed_event" };
+    return SUPPRESSED_MALFORMED;
   }
   return notifications.length > 0
     ? { notifications, classification: "event.translated", reason: kind }
@@ -210,6 +277,7 @@ export function translateEvents(
 ): Notification[] {
   const out: Notification[] = [];
   let last = previous;
+  if (!Array.isArray(events)) return out;
   for (const event of events) {
     for (const n of translateEvent(event)) {
       const repeat =
