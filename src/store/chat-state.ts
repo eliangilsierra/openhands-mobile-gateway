@@ -84,4 +84,17 @@ export class ChatStateRepository {
         .run(channel, externalChatId, project, timestamp, timestamp),
     );
   }
+
+  /**
+   * Deletes the state of one chat on request (retention policy, see `src/store/README.md`).
+   * Returns `true` when a row existed. Bindings and dedupe rows are left untouched.
+   */
+  delete(channel: string, externalChatId: string): boolean {
+    const result = withBusyRetry(this.logger, "chat_state.delete", () =>
+      this.db
+        .prepare("DELETE FROM chat_state WHERE channel = ? AND external_chat_id = ?")
+        .run(channel, externalChatId),
+    );
+    return Number(result.changes) > 0;
+  }
 }

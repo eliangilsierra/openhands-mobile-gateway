@@ -144,4 +144,32 @@ export class ConversationBindingRepository {
         .run(timestamp, conversationId),
     );
   }
+
+  /**
+   * Retention: deletes `closed` and `stale` bindings whose `last_used_at` is older than
+   * `maxAgeMs`. Never deletes `active` bindings, and keeps any binding whose conversation still
+   * has an unresolved `pending_confirmation` (it is needed to answer the prompt). Returns the
+   * number of rows deleted.
+   */
+  pruneInactive(maxAgeMs: number): number {
+    if (!Number.isFinite(maxAgeMs) || maxAgeMs < 0) {
+      throw new RangeError("maxAgeMs must be a non-negative finite number");
+    }
+    const cutoff = new Date(this.now().getTime() - maxAgeMs).toISOString();
+    const result = withBusyRetry(this.logger, "conversation_binding.prune_inactive", () =>
+      this.db
+        .prepare(
+          `DELETE FROM conversation_binding
+           WHERE state IN ('closed', 'stale')
+             AND last_used_at < ?
+             AND NOT EXISTS (
+               SELECT 1 FROM pending_confirmation pc
+               WHERE pc.conversation_id = conversation_binding.conversation_id
+                 AND pc.resolved_at IS NULL
+             )`,
+        )
+        .run(cutoff),
+    );
+    return Number(result.changes);
+  }
 }
