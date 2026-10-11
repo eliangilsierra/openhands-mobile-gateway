@@ -36,7 +36,10 @@ export function resolveByMembership(key: string, entries: readonly ProjectEntry[
   return entries.find((entry) => entry.key === key) ?? null;
 }
 
-/** Control 4: the path is exactly `root + "/" + <one segment>` and that segment is `key`. */
+/**
+ * Control 4: the path is exactly `root + "/" + <one segment>` and that segment is `key`.
+ * Lexical only: it does not resolve symlinks; the agent-server is trusted to list real subdirectories.
+ */
 export function isDirectChildOfRoot(root: string, entry: ProjectEntry): boolean {
   const prefix = `${normalizeRoot(root)}/`;
   if (!entry.workingDir.startsWith(prefix)) {
@@ -72,17 +75,23 @@ export interface ProjectRegistryOptions {
   readonly cacheTtlMs?: number;
 }
 
-function pathsFrom(payload: unknown): string[] {
+/** The item array of a payload (bare array or `{ items }`), or `null` when the shape is unrecognised. */
+function itemsFrom(payload: unknown): unknown[] | null {
   const items: unknown = Array.isArray(payload)
     ? payload
     : typeof payload === "object" && payload !== null && "items" in payload
       ? (payload as { items: unknown }).items
-      : [];
-  if (!Array.isArray(items)) {
+      : null;
+  return Array.isArray(items) ? (items as unknown[]) : null;
+}
+
+function pathsFrom(payload: unknown): string[] {
+  const items = itemsFrom(payload);
+  if (items === null) {
     return [];
   }
   const paths: string[] = [];
-  for (const item of items as unknown[]) {
+  for (const item of items) {
     if (typeof item === "string") {
       paths.push(item);
     } else if (typeof item === "object" && item !== null && "path" in item) {
@@ -158,7 +167,16 @@ export class ProjectRegistry {
   private async fromOpenHands(): Promise<ListProjectsResult> {
     try {
       const payload = await this.options.client.searchSubdirs(this.root);
-      return { status: "ok", projects: this.fromPaths(pathsFrom(payload)) };
+      const items = itemsFrom(payload);
+      const paths = pathsFrom(payload);
+      if (items === null || (items.length > 0 && paths.length === 0)) {
+        // A 200 with nothing recognisable is an empty source, not a good result (never cached).
+        this.options.logger?.warn("search_subdirs returned an unrecognised payload", {
+          event: "projects.unrecognised_payload",
+        });
+        return { status: "no_source" };
+      }
+      return { status: "ok", projects: this.fromPaths(paths) };
     } catch (error) {
       if (!(error instanceof UnexpectedResponseError) || (error.status !== 404 && error.status !== 501)) {
         return this.failure(error);
@@ -172,8 +190,11 @@ export class ProjectRegistry {
       const projects = this.fromPaths(pathsFrom(await this.options.client.listWorkspaces()));
       return projects.length > 0 ? { status: "ok", projects } : { status: "no_source" };
     } catch (error) {
-      this.failure(error);
-      return { status: "no_source" };
+      if (error instanceof UnexpectedResponseError && (error.status === 404 || error.status === 501)) {
+        return { status: "no_source" };
+      }
+      // 5xx, timeout, network or any other failure: the source may exist, so report an outage.
+      return this.failure(error);
     }
   }
 

@@ -3,7 +3,14 @@ import type { Context } from "grammy";
 import type { Update } from "grammy/types";
 import type { DatabaseSync } from "node:sqlite";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { registerProjects } from "../../../src/channels/telegram/commands/projects.js";
+import {
+  ERROR_TEXT,
+  MAX_MESSAGE_CHARS,
+  UNAVAILABLE_TEXT,
+  formatProjectList,
+  projectKeyboard,
+  registerProjects,
+} from "../../../src/channels/telegram/commands/projects.js";
 import { NOT_FOUND_TEXT, registerUse } from "../../../src/channels/telegram/commands/use.js";
 import { ProjectRegistry } from "../../../src/core/projects.js";
 import { createOpenHandsRestClient } from "../../../src/openhands/rest.js";
@@ -68,7 +75,96 @@ function build(staticProjects: readonly string[] | null) {
 const replies = (calls: ApiCall[]) =>
   calls.filter((c) => c.method === "sendMessage").map((c) => c.payload["text"] as string);
 
+const entryOf = (key: string) => ({ key, workingDir: `/projects/${key}` });
+const callbackData = (key: string): string[] =>
+  projectKeyboard([entryOf(key)])
+    .inline_keyboard.flat()
+    .map((b) => ("callback_data" in b ? b.callback_data : ""));
+
+describe("projectKeyboard", () => {
+  it("keeps a button whose callback_data is exactly 64 bytes and drops a 65-byte one", () => {
+    const fits = "a".repeat(60);
+    const tooLong = "a".repeat(61);
+    expect(callbackData(fits)).toEqual([`use:${fits}`]);
+    expect(callbackData(tooLong)).toEqual([]);
+  });
+
+  it.each([1, 2, 3, 4, 8])("never ends with an empty row for %i buttons", (count) => {
+    const projects = Array.from({ length: count }, (_, i) => entryOf(`p${i}`));
+    const rows = projectKeyboard(projects).inline_keyboard;
+    expect(rows.every((row) => row.length > 0)).toBe(true);
+    expect(rows.flat()).toHaveLength(count);
+  });
+});
+
+describe("formatProjectList", () => {
+  it("stays within Telegram's limit with a huge list and says how many were omitted", () => {
+    const projects = Array.from({ length: 2000 }, (_, i) => entryOf(`project-${String(i).padStart(4, "0")}-${"x".repeat(40)}`));
+    const text = formatProjectList(projects);
+    expect(text.length).toBeLessThanOrEqual(MAX_MESSAGE_CHARS);
+    expect(text.length).toBeLessThanOrEqual(4096);
+    const last = text.split("\n").at(-1) ?? "";
+    const shown = text.split("\n").length - 2;
+    expect(last).toBe(`+${projects.length - shown} más`);
+  });
+
+  it("does not add a footer when everything fits", () => {
+    const text = formatProjectList([entryOf("a"), entryOf("b")]);
+    expect(text).toBe("Proyectos disponibles:\n1. a\n2. b");
+  });
+});
+
 describe("/projects and /use", () => {
+  it("replies within the limit for a huge workspace list", async () => {
+    const names = Array.from({ length: 1500 }, (_, i) => `ws-${i}-${"y".repeat(50)}`);
+    const { bot, calls } = build(names);
+    await bot.handleUpdate(messageUpdate(1, USER, "/projects"));
+    const text = replies(calls)[0] ?? "";
+    expect(text.length).toBeLessThanOrEqual(4096);
+    expect(text).toMatch(/\+\d+ más$/);
+  });
+
+  it("replies with a fixed safe message when the registry throws", async () => {
+    const { bot, calls } = build(null);
+    server.addRule({ method: "GET", path: "/api/file/search_subdirs", status: 500 });
+    await bot.handleUpdate(messageUpdate(1, USER, "/projects"));
+    expect(replies(calls)).toEqual([UNAVAILABLE_TEXT]);
+
+    const failing = new Bot<Context>("123456:TEST-TOKEN-NOT-REAL");
+    failing.botInfo = bot.botInfo;
+    const failingCalls = installFakeApi(failing, () => ({ ok: true, result: true }));
+    const logged: { msg: string; fields?: Record<string, unknown> }[] = [];
+    const logger = {
+      debug: () => undefined,
+      info: () => undefined,
+      warn: () => undefined,
+      error: (msg: string, fields?: Record<string, unknown>) => void logged.push({ msg, ...(fields ? { fields } : {}) }),
+    };
+    registerProjects(failing, { list: () => Promise.reject(new Error("secret-token upstream body")) }, logger);
+    registerUse(failing, { registry: { resolve: () => Promise.reject(new Error("boom secret")) }, chatState, bindings }, logger);
+    await failing.handleUpdate(messageUpdate(2, USER, "/projects"));
+    await failing.handleUpdate(messageUpdate(3, USER, "/use alpha"));
+    expect(replies(failingCalls)).toEqual([ERROR_TEXT, ERROR_TEXT]);
+    expect(JSON.stringify(logged)).not.toContain("secret");
+    expect(logged.map((l) => l.fields?.["event"])).toEqual(["telegram.projects_failed", "telegram.use_failed"]);
+  });
+
+  it("answers the callback query before doing upstream work", async () => {
+    const { bot, calls } = build(["alpha"]);
+    await bot.handleUpdate({
+      update_id: 1,
+      callback_query: {
+        id: "cb1",
+        chat_instance: "ci",
+        from: { id: USER, is_bot: false, first_name: "Tester" },
+        data: "use:alpha",
+        message: { message_id: 5, date: 1_700_000_000, chat: { id: USER, type: "private", first_name: "Tester" } },
+      },
+    });
+    const methods = calls.map((c) => c.method);
+    expect(methods.indexOf("answerCallbackQuery")).toBeLessThan(methods.indexOf("sendMessage"));
+  });
+
   it("T-AC-1: lists two projects then selects one", async () => {
     const { bot, calls } = build(["toneprofiler", "code-sentinel"]);
     await bot.handleUpdate(messageUpdate(1, USER, "/projects"));

@@ -1,6 +1,7 @@
 import type { Bot, Context } from "grammy";
 import { selectProject, type SelectProjectDeps } from "../../../core/projects.js";
-import { NO_SOURCE_TEXT, UNAVAILABLE_TEXT, USE_CALLBACK_PREFIX } from "./projects.js";
+import type { Logger } from "../../../logger.js";
+import { ERROR_TEXT, NO_SOURCE_TEXT, UNAVAILABLE_TEXT, USE_CALLBACK_PREFIX, logHandlerError } from "./projects.js";
 import { TELEGRAM_CHANNEL } from "./start.js";
 
 export const NOT_FOUND_TEXT = "⚠️ Proyecto no encontrado. Usa /projects para ver la lista.";
@@ -30,21 +31,35 @@ async function replyFor(ctx: Context, deps: SelectProjectDeps, key: string): Pro
   }
 }
 
+async function safeReplyFor(
+  ctx: Context,
+  deps: SelectProjectDeps,
+  key: string,
+  logger: Logger | undefined,
+): Promise<string> {
+  try {
+    return await replyFor(ctx, deps, key);
+  } catch (error) {
+    logHandlerError(logger, "telegram.use_failed", error);
+    return ERROR_TEXT;
+  }
+}
+
 /** `/use <key>` and the `/projects` inline buttons (`SelectProject` intent). */
-export function registerUse(bot: Bot<Context>, deps: SelectProjectDeps): void {
+export function registerUse(bot: Bot<Context>, deps: SelectProjectDeps, logger?: Logger): void {
   bot.command("use", async (ctx) => {
     const key = ctx.match.trim();
     if (key.length === 0) {
       await ctx.reply(USAGE_TEXT);
       return;
     }
-    await ctx.reply(await replyFor(ctx, deps, key));
+    await ctx.reply(await safeReplyFor(ctx, deps, key, logger));
   });
 
   bot.callbackQuery(new RegExp(`^${USE_CALLBACK_PREFIX}(.+)$`, "s"), async (ctx) => {
     const key = ctx.match[1] ?? "";
-    const text = await replyFor(ctx, deps, key);
     await ctx.answerCallbackQuery();
+    const text = await safeReplyFor(ctx, deps, key, logger);
     await ctx.reply(text);
   });
 }

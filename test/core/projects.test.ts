@@ -141,6 +141,40 @@ describe("resolution order", () => {
     });
   });
 
+  it.each([500, 403])("does not fall back on %i from search_subdirs", async (code) => {
+    const client = fakeClient({ searchSubdirs: () => Promise.reject(status(code)) });
+    const registry = new ProjectRegistry({ projectsRoot: ROOT, staticProjects: null, client });
+    expect(await registry.list()).toEqual({ status: "unavailable" });
+    expect(client.listWorkspaces).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["500", () => Promise.reject(status(500))],
+    ["503 outage", () => Promise.reject(new UnavailableError({ method: "GET", route: "/x", status: 503 }))],
+    ["network error", () => Promise.reject(new TypeError("fetch failed"))],
+  ])("reports unavailable, not no_source, when workspaces fails with %s", async (_name, fail) => {
+    const client = fakeClient({
+      searchSubdirs: () => Promise.reject(status(404)),
+      listWorkspaces: fail as () => Promise<WorkspaceList>,
+    });
+    const registry = new ProjectRegistry({ projectsRoot: ROOT, staticProjects: null, client });
+    expect(await registry.list()).toEqual({ status: "unavailable" });
+  });
+
+  it.each([
+    ["an unrecognised object", { foo: 1 }],
+    ["null", null],
+    ["items of unusable entries", { items: [1, 2] }],
+  ])("treats a 200 with %s as an empty source and does not cache it", async (_name, payload) => {
+    let current: unknown = payload;
+    const client = fakeClient({ searchSubdirs: () => Promise.resolve(current as SubdirsResult) });
+    const registry = new ProjectRegistry({ projectsRoot: ROOT, staticProjects: null, client });
+    expect(await registry.list()).toEqual({ status: "no_source" });
+    expect(client.listWorkspaces).not.toHaveBeenCalled();
+    current = ["/projects/alpha"];
+    expect(await registry.list()).toEqual({ status: "ok", projects: [entry("alpha")] });
+  });
+
   it("does not fall back on an outage and does not cache the failure", async () => {
     let fail = true;
     const client = fakeClient({
