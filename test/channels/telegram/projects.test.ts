@@ -165,6 +165,50 @@ describe("/projects and /use", () => {
     expect(methods.indexOf("answerCallbackQuery")).toBeLessThan(methods.indexOf("sendMessage"));
   });
 
+  it("answers the callback query while the upstream lookup is still pending", async () => {
+    let release: (value: { status: "not_found" }) => void = () => undefined;
+    const gate = new Promise<{ status: "not_found" }>((resolve) => {
+      release = resolve;
+    });
+    let lookups = 0;
+    const gated = new Bot<Context>("123456:TEST-TOKEN-NOT-REAL");
+    gated.botInfo = build(["alpha"]).bot.botInfo;
+    const gatedCalls = installFakeApi(gated, () => ({ ok: true, result: true }));
+    registerUse(
+      gated,
+      {
+        registry: {
+          resolve: () => {
+            lookups += 1;
+            return gate;
+          },
+        },
+        chatState,
+        bindings,
+      },
+    );
+    const handling = gated.handleUpdate({
+      update_id: 1,
+      callback_query: {
+        id: "cb1",
+        chat_instance: "ci",
+        from: { id: USER, is_bot: false, first_name: "Tester" },
+        data: "use:alpha",
+        message: { message_id: 5, date: 1_700_000_000, chat: { id: USER, type: "private", first_name: "Tester" } },
+      },
+    });
+    // Let the handler run up to its first suspension point.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(gatedCalls.map((c) => c.method)).toContain("answerCallbackQuery");
+    expect(gatedCalls.map((c) => c.method)).not.toContain("sendMessage");
+    expect(lookups).toBeLessThanOrEqual(1);
+
+    release({ status: "not_found" });
+    await handling;
+    expect(lookups).toBe(1);
+    expect(replies(gatedCalls)).toEqual([NOT_FOUND_TEXT]);
+  });
+
   it("T-AC-1: lists two projects then selects one", async () => {
     const { bot, calls } = build(["toneprofiler", "code-sentinel"]);
     await bot.handleUpdate(messageUpdate(1, USER, "/projects"));
