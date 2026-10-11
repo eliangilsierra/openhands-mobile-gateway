@@ -2,7 +2,13 @@ import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConfigError, loadConfig, secretValues, type GatewayConfig } from "../src/config.js";
 import { createLogger } from "../src/logger.js";
-import { installProcessHandlers, startGateway, type RunningGateway } from "../src/main.js";
+import {
+  createShutdownHandler,
+  installProcessHandlers,
+  isLoopbackHost,
+  startGateway,
+  type RunningGateway,
+} from "../src/main.js";
 import { startMockOpenHandsServer, type MockOpenHandsServer } from "./mocks/openhands-server.js";
 import {
   BOT_INFO,
@@ -98,7 +104,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  await gateway?.shutdown();
+  // A test may have forced a shutdown timeout; that rejection is expected there.
+  await gateway?.shutdown().catch(() => undefined);
   gateway = undefined;
   await mock.close();
   vi.restoreAllMocks();
@@ -217,6 +224,82 @@ describe("startGateway", () => {
   });
 });
 
+describe("logger redaction of JSON-escaped secrets", () => {
+  it("redacts a secret containing a quote and a backslash in raw and escaped form", () => {
+    const secret = 'pa"ss\\wo\\rd-' + randomUUID();
+    const escaped = JSON.stringify(secret).slice(1, -1);
+    const config = { ...baseConfig(), openhandsApiKey: secret };
+    expect(secretValues(config)).toContain(escaped);
+
+    testLogger(config).error("failure", { event: "x", err_msg: `bad key ${secret}` });
+    // The logger alone must also cover it, whatever list the caller passes.
+    createLogger({ level: "debug", secrets: [secret], write: (line) => lines.push(line) }).error("f", {
+      err_msg: `bad key ${secret}`,
+    });
+
+    const output = lines.join("\n");
+    expect(output).toContain("***");
+    expect(output).not.toContain(secret);
+    expect(output).not.toContain(escaped);
+  });
+});
+
+describe("health host warning", () => {
+  it.each([
+    ["127.0.0.1", true],
+    ["127.0.0.2", true],
+    ["::1", true],
+    ["localhost", true],
+    ["0.0.0.0", false],
+    ["::", false],
+    ["192.0.2.10", false],
+  ])("isLoopbackHost(%s) is %s", (host, expected) => {
+    expect(isLoopbackHost(host)).toBe(expected);
+  });
+
+  it("warns without secrets when HEALTH_HOST is not loopback", async () => {
+    const config = baseConfig({ healthHost: "0.0.0.0" });
+    gateway = await startGateway(config, { logger: testLogger(config) });
+
+    const warn = lines.find((line) => line.includes('"event":"health.non_loopback_host"'));
+    expect(warn).toContain('"level":"warn"');
+    expect(warn).not.toContain(API_KEY);
+    expect(warn).not.toContain(BOT_TOKEN);
+  });
+
+  it("does not warn for the loopback default", async () => {
+    const config = baseConfig();
+    gateway = await startGateway(config, { logger: testLogger(config) });
+
+    expect(lines.some((line) => line.includes("health.non_loopback_host"))).toBe(false);
+  });
+});
+
+/** Fake Telegram whose getUpdates ignores the abort signal, so polling never finishes. */
+function hangingTransport(bot: Parameters<typeof installFakeApi>[0]): void {
+  installFakeApi(bot, (call): ApiResult | Promise<ApiResult> =>
+    call.method === "getMe" ? { ok: true, result: BOT_INFO } : new Promise<ApiResult>(() => undefined),
+  );
+}
+
+describe("shutdown deadline", () => {
+  it("rejects when graceful shutdown does not finish within the deadline", async () => {
+    const config = baseConfig();
+    gateway = await startGateway(config, {
+      logger: testLogger(config),
+      shutdownDeadlineMs: 50,
+      configureBot: hangingTransport,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    await expect(gateway.shutdown()).rejects.toThrow(/deadline exceeded/);
+    const output = lines.join("\n");
+    expect(output).toContain('"event":"shutdown.deadline_exceeded"');
+    expect(output).not.toContain(BOT_TOKEN);
+    expect(output).not.toContain(API_KEY);
+  });
+});
+
 describe("installProcessHandlers", () => {
   it("logs only the type and a sanitised message for unhandled errors, then exits 1", () => {
     const config = baseConfig();
@@ -262,5 +345,74 @@ describe("installProcessHandlers", () => {
 
     expect(onShutdown).toHaveBeenCalledTimes(2);
     expect(exit).toHaveBeenCalledWith(0);
+  });
+  function captureSignals(): Map<string, () => void> {
+    const handlers = new Map<string, () => void>();
+    vi.spyOn(process, "on").mockImplementation((() => process) as never);
+    vi.spyOn(process, "once").mockImplementation(((event: string, listener: () => void) => {
+      handlers.set(event, listener);
+      return process;
+    }) as never);
+    return handlers;
+  }
+
+  it("logs shutdown.failed without secrets and exits 1 when shutdown rejects", async () => {
+    const config = baseConfig();
+    const handlers = captureSignals();
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+
+    installProcessHandlers(testLogger(config), () => Promise.reject(new Error(`boom ${BOT_TOKEN}`)));
+    handlers.get("SIGTERM")?.();
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1));
+
+    const output = lines.join("\n");
+    expect(output).toContain('"event":"shutdown.failed"');
+    expect(output).not.toContain(BOT_TOKEN);
+    expect(exit).not.toHaveBeenCalledWith(0);
+  });
+
+  it("exits 1 when a running gateway hits the shutdown deadline", async () => {
+    const config = baseConfig();
+    const handlers = captureSignals();
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    gateway = await startGateway(config, {
+      logger: testLogger(config),
+      shutdownDeadlineMs: 50,
+      configureBot: hangingTransport,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    installProcessHandlers(testLogger(config), createShutdownHandler(() => gateway));
+    handlers.get("SIGTERM")?.();
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1));
+
+    expect(exit).not.toHaveBeenCalledWith(0);
+    expect(lines.join("\n")).toContain('"event":"shutdown.failed"');
+  });
+
+  it("is idempotent when the gateway is shut down twice", async () => {
+    const config = baseConfig();
+    gateway = await startGateway(config, {
+      logger: testLogger(config),
+      configureBot: (bot) => fakeTransport(bot, {}),
+    });
+
+    const handler = createShutdownHandler(() => gateway);
+    await handler();
+    await handler();
+
+    expect(lines.filter((line) => line.includes('"event":"shutdown.done"'))).toHaveLength(1);
+  });
+
+  it("exits 0 without error when SIGTERM arrives before startup completes", async () => {
+    const config = baseConfig();
+    const handlers = captureSignals();
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+
+    installProcessHandlers(testLogger(config), createShutdownHandler(() => undefined));
+    handlers.get("SIGTERM")?.();
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+
+    expect(lines.join("\n")).not.toContain("shutdown.failed");
   });
 });

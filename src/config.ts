@@ -96,8 +96,10 @@ const optionalProjectList = z
 
 const healthPort = z
   .string()
+  .trim()
   .optional()
   .default("8080")
+  .refine((value) => /^\d+$/.test(value), "HEALTH_PORT must be a valid TCP port")
   .transform((value) => Number.parseInt(value, 10))
   .pipe(z.number().int().min(1, "HEALTH_PORT must be a valid TCP port").max(65535, "HEALTH_PORT must be a valid TCP port"));
 
@@ -169,6 +171,14 @@ export function secretValues(config: GatewayConfig): readonly string[] {
     const encoded = encodeURIComponent(secret);
     if (encoded !== secret) {
       values.push(encoded);
+    }
+  }
+  // The logger redacts the serialised JSON line, where `"` and `\` appear escaped, so the escaped
+  // form of every secret is listed too.
+  for (const secret of [...values]) {
+    const escaped = JSON.stringify(secret).slice(1, -1);
+    if (escaped !== secret) {
+      values.push(escaped);
     }
   }
   return values;

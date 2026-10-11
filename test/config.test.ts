@@ -121,6 +121,20 @@ describe("loadConfig", () => {
   });
 });
 
+describe("HEALTH_PORT format", () => {
+  it.each(["8080abc", "80.5", "1e3", "0x50", "-1", "", "0", "65536"])("rejects %j", (port) => {
+    expect(() => loadConfig({ ...VALID_ENV, HEALTH_PORT: port })).toThrow(ConfigError);
+  });
+
+  it.each([
+    ["1", 1],
+    ["8080", 8080],
+    ["65535", 65535],
+  ])("accepts %s", (port, expected) => {
+    expect(loadConfig({ ...VALID_ENV, HEALTH_PORT: port }).healthPort).toBe(expected);
+  });
+});
+
 describe("secretValues", () => {
   it("lists exactly the two known secret values from the config", () => {
     const config = loadConfig({ ...VALID_ENV });

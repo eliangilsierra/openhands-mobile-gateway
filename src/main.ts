@@ -103,6 +103,8 @@ export function readPackageVersion(): string {
 export interface StartGatewayOptions {
   readonly logger?: Logger;
   readonly version?: string;
+  /** Shutdown deadline in ms; defaults to {@link SHUTDOWN_DEADLINE_MS}. */
+  readonly shutdownDeadlineMs?: number;
   /** Called with the bot before polling starts, so tests can replace the Telegram transport. */
   readonly configureBot?: (bot: Bot<Context>) => void;
 }
@@ -115,15 +117,34 @@ export interface RunningGateway {
   shutdown(): Promise<void>;
 }
 
+/** Rejects (so the process exits non-zero) when graceful shutdown does not finish in time. */
+class ShutdownTimeoutError extends Error {
+  constructor() {
+    super("Shutdown deadline exceeded; resources may still be open");
+    this.name = "ShutdownTimeoutError";
+  }
+}
+
 function withDeadline(work: Promise<void>, ms: number, onTimeout: () => void): Promise<void> {
   let timer: NodeJS.Timeout | undefined;
-  const deadline = new Promise<void>((resolve) => {
+  const deadline = new Promise<void>((_resolve, reject) => {
     timer = setTimeout(() => {
       onTimeout();
-      resolve();
+      reject(new ShutdownTimeoutError());
     }, ms);
   });
   return Promise.race([work, deadline]).finally(() => clearTimeout(timer));
+}
+
+export function isLoopbackHost(host: string): boolean {
+  return host === "localhost" || host === "::1" || /^127(\.\d{1,3}){3}$/.test(host);
+}
+
+/** Shutdown callback for the signal handlers; a signal before startup completes is a no-op. */
+export function createShutdownHandler(getGateway: () => RunningGateway | undefined): () => Promise<void> {
+  return async () => {
+    await getGateway()?.shutdown();
+  };
 }
 
 /**
@@ -144,6 +165,11 @@ export async function startGateway(
   }
 
   const logger = options.logger ?? createLogger({ level: config.logLevel, secrets: secretValues(config) });
+  if (!isLoopbackHost(config.healthHost)) {
+    logger.warn("Health server is bound to a non-loopback address; /health is reachable from the network", {
+      event: "health.non_loopback_host",
+    });
+  }
   const db = openStore({ databasePath: config.databasePath, logger });
   const telegramStatus = new TelegramStatus();
   let bot: Bot<Context>;
@@ -192,7 +218,7 @@ export async function startGateway(
         closeStore(db);
         logger.info("Gateway stopped", { event: "shutdown.done" });
       })(),
-      SHUTDOWN_DEADLINE_MS,
+      options.shutdownDeadlineMs ?? SHUTDOWN_DEADLINE_MS,
       () => {
         logger.error("Shutdown deadline exceeded", { event: "shutdown.deadline_exceeded" });
       },
@@ -217,9 +243,7 @@ export async function main(): Promise<void> {
   // Built from every secret in the config: the bot token (also URL-encoded) and the API key.
   const logger = createLogger({ level: config.logLevel, secrets: secretValues(config) });
   let gateway: RunningGateway | undefined;
-  installProcessHandlers(logger, async () => {
-    await gateway?.shutdown();
-  });
+  installProcessHandlers(logger, createShutdownHandler(() => gateway));
   logger.info("Gateway configuration loaded", { event: "boot.config_ok" });
 
   try {
