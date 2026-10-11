@@ -72,11 +72,34 @@ describe("taxonomy", () => {
     expect(translateEvent(ev("ConversationStateUpdateEvent", { key: "stats", value: "finished" }))).toEqual([]);
   });
 
-  it("AgentErrorEvent -> failure without leaking the error body", () => {
+  it("AgentErrorEvent -> non-terminal tool warning (failure comes from the status), no error body", () => {
     const e = ev("AgentErrorEvent", { error: "Traceback with token=abc123456789" });
     const [out] = translateEvent(e);
-    expect(out).toMatchObject({ text: "💥 La tarea falló", severity: "error", terminal: true });
+    expect(out).toMatchObject({ text: "⚠️ Una herramienta devolvió un error", category: "tool", severity: "warning", terminal: false });
     expect(JSON.stringify(out)).not.toContain("abc123456789");
+  });
+
+  it("a recoverable tool error followed by finish is not reported as a failed task", () => {
+    const out = translateEvents([
+      ev("AgentErrorEvent", { error: "boom" }),
+      ev("ActionEvent", { tool_name: "finish", action: { message: "fixed" } }),
+    ]);
+    expect(out.some((x) => x.category === "failed")).toBe(false);
+    expect(out.filter((x) => x.terminal).map((x) => x.category)).toEqual(["completed"]);
+  });
+
+  it("an edit whose summary names a test runner is still an edit (CR-3)", () => {
+    for (const summary of ["Update jest config", "Fix mocha setup", "tox.ini edit"]) {
+      const e = ev("ActionEvent", { tool_name: "str_replace_editor", summary, action: { path: "src/conf.ts" } });
+      expect(translateEvent(e)).toEqual([
+        { text: "🔧 Modificando: src/conf.ts", category: "editing", severity: "info", terminal: false },
+      ]);
+    }
+    expect(texts([ev("ActionEvent", { tool_name: "file_editor", summary: "Update jest config" })])).toEqual([
+      "🔧 Modificando: Update jest config",
+    ]);
+    // shell tools are still recognised
+    expect(texts([ev("ActionEvent", { tool_name: "terminal", action: { command: "pytest -q" } })])).toEqual(["🧪 Ejecutando tests…"]);
   });
 
   it("T-AC-3: UserRejectObservation from user -> Acción denegada; other sources suppressed", () => {
@@ -380,5 +403,211 @@ describe("purity (no clock, randomness or I/O)", () => {
     expect(translateWithClassification(input[0] as OpenHandsEvent)).toEqual(
       translateWithClassification(input[0] as OpenHandsEvent),
     );
+  });
+});
+
+// Synthetic secrets are assembled at runtime so no literal credential sits in the repository.
+const j = (...parts: string[]): string => parts.join("");
+const GH = j("gh", "p_", "abcdefghijklmnop1234");
+const ZW = "\u200b";
+const toFullwidth = (s: string): string =>
+  Array.from(s, (c) => (c >= "!" && c <= "~" ? String.fromCodePoint((c.codePointAt(0) ?? 0) + 0xfee0) : c)).join("");
+
+describe("bounded cost on pathological input (F1, CR-1)", () => {
+  const LIMIT_MS = 500; // linear implementation: a few ms; the quadratic one needed seconds to minutes
+  const cases: Array<[string, string]> = [
+    ["1e5 digits and a colon", `${"1".repeat(100_000)}:`],
+    ["1e6 digits and a colon", `${"1".repeat(1_000_000)}:`],
+    ["2e5 chars of repeated `token: value`", j("tok", "en: value1234 ").repeat(12_000)],
+    ["2e5 chars of repeated keyword=value", j("api_", "key", "=", "abcd1234 ").repeat(12_000)],
+    ["130k chars of sk- keys followed by a zero-width space", j("sk", "-ABCDEFGH", ZW, " ").repeat(10_000)],
+    ["150k chars of split provider prefixes", j("ghp_ ", ZW).repeat(30_000)],
+    ["repeated PEM headers", j("-----BEGIN ", "PRIVATE KEY-----").repeat(5_000)],
+    ["300k whitespace then a secret", `${" ".repeat(300_000)}${GH}`],
+    ["200k combining marks", `a${"\u0301".repeat(200_000)}`],
+  ];
+  for (const [name, input] of cases) {
+    it(`sanitizeDetail stays fast and bounded: ${name}`, () => {
+      const start = performance.now();
+      const out = sanitizeDetail(input);
+      expect(performance.now() - start).toBeLessThan(LIMIT_MS);
+      expect(Array.from(out).length).toBeLessThanOrEqual(MAX_DETAIL_LENGTH);
+    });
+  }
+
+  it("5 MB summaries, finish messages and commands translate quickly through the public API", () => {
+    const big = j("tok", "en: value1234 ").repeat(300_000);
+    const start = performance.now();
+    const a = translateEvent(ev("ActionEvent", { tool_name: "browser", summary: big }));
+    const b = translateEvent(ev("ActionEvent", { tool_name: "finish", action: { message: big } }));
+    const c = translateEvent(ev("ActionEvent", { tool_name: "terminal", action: { command: `${" ".repeat(5_000_000)}x` } }));
+    expect(performance.now() - start).toBeLessThan(LIMIT_MS * 2);
+    expect(a).toHaveLength(1);
+    expect(b).toHaveLength(1);
+    expect(c).toHaveLength(1);
+    expect(Array.from(a[0]?.text ?? "").length).toBeLessThanOrEqual(MAX_DETAIL_LENGTH + 20);
+  });
+
+  it("caps the input before scanning and respects a custom maxLength", () => {
+    const out = sanitizeDetail("a".repeat(1_000_000));
+    expect(Array.from(out)).toHaveLength(MAX_DETAIL_LENGTH);
+    expect(out.endsWith("…")).toBe(true);
+    expect(sanitizeDetail("abcdefghij", 5)).toBe("abcd…");
+    expect(sanitizeDetail("abc", Number.NaN)).toBe("abc");
+  });
+});
+
+describe("redaction covers common secret formats (F2)", () => {
+  const leaks = (input: string, secret: string): void => {
+    const out = sanitizeDetail(input);
+    expect(out).toContain("[redacted]");
+    expect(out).not.toContain(secret);
+  };
+
+  it("environment assignments whose name ends in _API_KEY or _SECRET_ACCESS_KEY", () => {
+    leaks(j("OPENAI_API", "_KEY", "=", "abcd1234efgh5678"), "abcd1234efgh5678");
+    leaks(j("export AWS_SECRET", "_ACCESS_KEY", "=", "wJalr1234567890abcdEFGH"), "wJalr1234567890abcdEFGH");
+    leaks(j("GITHUB_TOK", "EN", "=", "plainvalue99"), "plainvalue99");
+  });
+
+  it("JSON-quoted keys with quoted values", () => {
+    leaks(j('{"pass', 'word":', '"hunter2secret"}'), "hunter2secret");
+    leaks(j('{"tok', 'en": ', '"abc123def456"}'), "abc123def456");
+    leaks(j('{"X-Session-', 'API-Key": ', '"abc123def456"}'), "abc123def456");
+    leaks(j("X-Session-", "API-Key", ": abc123def456"), "abc123def456");
+  });
+
+  it("space separated forms", () => {
+    leaks(j("x-session-", "api-key", " abc123def456ghi"), "abc123def456ghi");
+    leaks(j("the pass", "word is hunter2secret ok"), "hunter2secret");
+  });
+
+  it("the whole Authorization header, scheme and credentials", () => {
+    expect(sanitizeDetail(j("Authori", "zation: Basic dXNlcjpwYXNzd29yZA=="))).toBe("[redacted]");
+    leaks(j("Authori", "zation: Bearer abcdefgh12345678"), "abcdefgh12345678");
+    leaks(j("curl -H 'authori", "zation: token ghx12345678'"), "ghx12345678");
+    leaks("sent Basic dXNlcjpwYXNzd29yZA== to host", "dXNlcjpwYXNz");
+  });
+
+  it("Telegram bot tokens inside URLs and bare", () => {
+    const secret = `${"A".repeat(10)}${"b1".repeat(12)}-_${"Z".repeat(3)}`;
+    leaks(`https://api.telegram.org/bot123456789:${secret}/getMe`, secret);
+    leaks(`123456789:${secret}`, secret);
+  });
+
+  it("AWS access key ids, also with a letter before them", () => {
+    const id = j("AK", "IA", "ABCDEFGHIJKLMNOP");
+    leaks(`id ${id} end`, id);
+    leaks(`x${id}`, id);
+  });
+
+  it("PEM private key blocks, complete or truncated", () => {
+    const begin = j("-----BEGIN ", "RSA PRIVATE", " KEY-----");
+    const end = j("-----END ", "RSA PRIVATE", " KEY-----");
+    const pem = `${begin}\nMIIEowIBAAKCAQEA1234\nabcdEFGH5678\n${end}`;
+    expect(sanitizeDetail(`key: ${pem} after`)).toBe("key: [redacted] after");
+    leaks(`${begin}\nMIIEvQIBADANBgkqhkiG`, "MIIEvQIBADANBgkq");
+  });
+
+  it("does not double-redact an already redacted value", () => {
+    expect(sanitizeDetail("[redacted]")).toBe("[redacted]");
+    expect(sanitizeDetail(j("pass", "word", "=", "[redacted]"))).toBe(j("pass", "word", "=", "[redacted]"));
+  });
+});
+
+describe("redaction survives look-alike and invisible encodings (F3)", () => {
+  const body = "abcdefghijklmnop1234";
+  const variants: Array<[string, string]> = [
+    ["plain space after the separator", `ghp_ ${body}`],
+    ["space before the separator", `ghp _${body}`],
+    ["U+2010 hyphen as the separator", `glpat\u2010${body}`],
+    ["U+034F combining grapheme joiner", `ghp_\u034f${body}`],
+    ["combining mark inside the body", "ghp_abcdefgh\u0301ijklmnop1234"],
+    ["U+E0020 tag character", `ghp_\u{e0020}${body}`],
+    ["U+3164 Hangul filler", `ghp_\u3164${body}`],
+    ["fullwidth prefix", toFullwidth("ghp_") + body],
+    ["fullwidth everything", toFullwidth(`ghp_${body}`)],
+  ];
+  for (const [name, input] of variants) {
+    it(`redacts: ${name}`, () => {
+      const out = sanitizeDetail(`edit ${input} now`);
+      expect(out).toContain("[redacted]");
+      expect(out).not.toContain("abcdefgh");
+      expect(out).not.toContain("ijklmnop");
+      expect(out).not.toContain("1234");
+    });
+  }
+
+  it("normalises compatibility characters and keeps accented text intact", () => {
+    expect(sanitizeDetail("cafe\u0301 \ufb01le")).toBe("caf\u00e9 file");
+  });
+});
+
+describe("redaction does not eat ordinary names and prose (CR-4)", () => {
+  it("keeps file names and prose that only look like keys", () => {
+    for (const s of [
+      "src/sk-utils-helper.ts",
+      "pk_migration_helper.py",
+      "src/sk-abcdefghijklmnop1234.ts",
+      "ask-abcdefghijklmnop1234",
+      j("fix tok", "en: handling in auth"),
+      j("my tok", "en: is great and the sec", "ret: sauce"),
+      "basic configuration for the build",
+      "git commit abcdef0123456789abcdef0123456789abcdef01",
+    ]) {
+      expect(sanitizeDetail(s)).toBe(s);
+    }
+  });
+
+  it("still redacts genuine keys next to the same words", () => {
+    expect(sanitizeDetail("use sk-abcdefghijklmnop1234 here")).toBe("use [redacted] here");
+    expect(sanitizeDetail("use sk-proj-Ab12Cd34Ef56Gh78 here")).toBe("use [redacted] here");
+    expect(sanitizeDetail(j("tok", "en: abc123def456"))).toBe("[redacted]");
+    expect(sanitizeDetail(j("pass", "word: hunter2secret"))).toBe("[redacted]");
+  });
+
+  it("shows a file edit with an sk- looking name in the notification", () => {
+    const e = ev("ActionEvent", { tool_name: "file_editor", action: { path: "src/sk-utils-helper.ts" } });
+    expect(texts([e])).toEqual(["🔧 Modificando: src/sk-utils-helper.ts"]);
+  });
+
+  describe("word boundary guard on split secrets", () => {
+    it("redacts a key split by an invisible character when it starts a word", () => {
+      expect(sanitizeDetail(`see sk-abcdefgh${ZW}ijklmnop1234`)).toBe("see [redacted]");
+      expect(sanitizeDetail(`see${ZW}sk-abcdefghijklmnop1234`)).toBe("see [redacted]");
+    });
+    it("leaves 'sk-' inside a longer word alone; an invisible character counts as a word break", () => {
+      expect(sanitizeDetail(`risk${ZW}sk-ish word`)).toBe("risk sk-ish word");
+      expect(sanitizeDetail("task-abcdefghijklmnop1234")).toBe("task-abcdefghijklmnop1234");
+      expect(sanitizeDetail(`ta${ZW}sk-abcdefghijklmnop1234`)).toBe("ta [redacted]"); // output shows a space: a new word
+    });
+    it("replaces exactly the secret span, not its neighbours", () => {
+      expect(sanitizeDetail(`a ${GH.slice(0, 8)}${ZW}${GH.slice(8)} b`)).toBe("a [redacted] b");
+    });
+  });
+});
+
+describe("completion is order independent (CR-5)", () => {
+  const finished = (): OpenHandsEvent => ev("ConversationStateUpdateEvent", { key: "execution_status", value: "finished" });
+  const finish = (): OpenHandsEvent => ev("ActionEvent", { tool_name: "finish", action: { message: "Done: fixed X" } });
+
+  it("status first, then finish with a summary: the summary wins", () => {
+    expect(texts([finished(), finish()])).toEqual(["✅ Tarea completada: Done: fixed X"]);
+  });
+
+  it("finish first, then status: one message with the summary", () => {
+    expect(texts([finish(), finished()])).toEqual(["✅ Tarea completada: Done: fixed X"]);
+  });
+
+  it("across batches the richer message is emitted after the bare one and then collapses", () => {
+    const first = translateEvents([finished()]);
+    const second = translateEvents([finish(), finished()], first.at(-1));
+    expect(second.map((x) => x.text)).toEqual(["✅ Tarea completada: Done: fixed X"]);
+    expect(translateEvents([finished()], second.at(-1))).toEqual([]);
+  });
+
+  it("a different later summary is not replaced by another one", () => {
+    const other = ev("ActionEvent", { tool_name: "finish", action: { message: "Second" } });
+    expect(texts([finish(), other])).toEqual(["✅ Tarea completada: Done: fixed X"]);
   });
 });
