@@ -100,6 +100,11 @@ function redact(line: string, secrets: readonly string[]): string {
       continue;
     }
     redacted = redacted.split(secret).join("***");
+    // The line is serialised JSON, where `"` and `\` are escaped: redact that form as well.
+    const escaped = JSON.stringify(secret).slice(1, -1);
+    if (escaped !== secret) {
+      redacted = redacted.split(escaped).join("***");
+    }
   }
   return redacted;
 }
