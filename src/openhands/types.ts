@@ -44,6 +44,10 @@ export interface RespondToConfirmationRequest {
 export interface SearchEventsParams {
   readonly timestamp__gte?: string;
   readonly limit?: number;
+  /** Sort key of the page; the subscriber asks for oldest first. */
+  readonly sort_order?: string;
+  /** Opaque cursor returned as `next_page_id` by the previous page. */
+  readonly page_id?: string;
 }
 
 export interface EventPage {

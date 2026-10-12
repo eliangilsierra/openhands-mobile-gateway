@@ -26,6 +26,11 @@ export interface SubmitTaskDeps {
   readonly bindings: Pick<ConversationBindingRepository, "findActive" | "create" | "markStale" | "touchLastUsed">;
   readonly client: Pick<OpenHandsRestClient, "createConversation" | "sendEvent">;
   readonly logger?: Logger;
+  /**
+   * Lifecycle hook: the conversation became active (task delivered), so its event subscription
+   * should be opened. Idempotent on the subscriber side; a failure never fails the task.
+   */
+  readonly activate?: (conversationId: string) => void;
   /** `MAX_TASK_CHARS`; defaults to {@link DEFAULT_MAX_TASK_CHARS}. */
   readonly maxTaskChars?: number;
 }
@@ -191,7 +196,20 @@ async function sendToExisting(
       err_type: error instanceof Error ? error.name : typeof error,
     });
   }
+  activate(deps, binding.conversationId);
   return { status: "sent" };
+}
+
+function activate(deps: SubmitTaskDeps, conversationId: string): void {
+  try {
+    deps.activate?.(conversationId);
+  } catch (error) {
+    deps.logger?.warn("Could not open the event subscription", {
+      event: "session.activate_failed",
+      conversation_id: conversationId,
+      err_type: error instanceof Error ? error.name : typeof error,
+    });
+  }
 }
 
 /**
@@ -254,6 +272,7 @@ async function createAndBind(
     });
     return { status: "outcome_unknown" };
   }
+  activate(deps, info.id);
   deps.logger?.info("Conversation created", {
     event: "session.conversation_created",
     channel: target.channel,
