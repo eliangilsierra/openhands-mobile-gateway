@@ -196,6 +196,27 @@ describe("startGateway", () => {
     expect(health.body["status"]).toBe("ok");
   });
 
+  it("reports a revoked token (401) as disconnected without degrading health", async () => {
+    const config = baseConfig();
+    gateway = await startGateway(config, {
+      logger: testLogger(config),
+      configureBot: (bot) => {
+        installFakeApi(bot, (call): ApiResult => {
+          if (call.method === "getMe") {
+            return { ok: true, result: BOT_INFO };
+          }
+          return { ok: false, error_code: 401, description: "Unauthorized" };
+        });
+      },
+    });
+
+    await waitFor(() => gateway?.telegramStatus.reason() === "unauthorized", "unauthorized");
+    const health = await getHealth(gateway.healthPort);
+    expect(health.body["telegram"]).toBe("disconnected");
+    expect(health.status).toBe(200);
+    expect(health.body["status"]).toBe("ok");
+  });
+
   it("refuses to start with an empty allowlist", async () => {
     const config = baseConfig({ telegramAllowedUserIds: [] });
 

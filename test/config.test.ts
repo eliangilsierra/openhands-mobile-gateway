@@ -30,6 +30,9 @@ describe("loadConfig", () => {
       healthHost: "127.0.0.1",
       healthCacheSeconds: 15,
       timezone: "Europe/Madrid",
+      eventPollSeconds: 5,
+      wsIdleSeconds: 900,
+      maxTaskChars: 8000,
     });
   });
 
@@ -192,5 +195,35 @@ describe("health settings", () => {
 
   it.each(["not a host", "", "example.com;x"])("rejects HEALTH_HOST=%j", (value) => {
     expect(() => loadConfig({ ...VALID_ENV, HEALTH_HOST: value })).toThrow(ConfigError);
+  });
+});
+
+describe("event and task settings", () => {
+  it("accepts explicit values at the bounds", () => {
+    const config = loadConfig({
+      ...VALID_ENV,
+      EVENT_POLL_SECONDS: "300",
+      WS_IDLE_SECONDS: "1",
+      MAX_TASK_CHARS: "32000",
+    });
+
+    expect(config.eventPollSeconds).toBe(300);
+    expect(config.wsIdleSeconds).toBe(1);
+    expect(config.maxTaskChars).toBe(32000);
+  });
+
+  it.each([
+    ["EVENT_POLL_SECONDS", "0"],
+    ["EVENT_POLL_SECONDS", "301"],
+    ["EVENT_POLL_SECONDS", "2.5"],
+    ["WS_IDLE_SECONDS", "0"],
+    ["WS_IDLE_SECONDS", "86401"],
+    ["WS_IDLE_SECONDS", "abc"],
+    ["MAX_TASK_CHARS", "0"],
+    ["MAX_TASK_CHARS", "32001"],
+    ["MAX_TASK_CHARS", ""],
+    ["MAX_TASK_CHARS", "-5"],
+  ])("rejects %s=%j", (key, value) => {
+    expect(() => loadConfig({ ...VALID_ENV, [key]: value })).toThrow(ConfigError);
   });
 });

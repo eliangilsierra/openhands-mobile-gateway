@@ -1,9 +1,20 @@
 import { Bot, GrammyError } from "grammy";
 import type { Context } from "grammy";
 import type { Logger } from "../../logger.js";
+import type { ConfirmationService } from "../../core/confirmations.js";
+import type { ProjectRegistry, SelectProjectDeps } from "../../core/projects.js";
+import type { SessionControlDeps, SubmitTaskDeps } from "../../core/session.js";
 import { registerHelp } from "./commands/help.js";
+import { registerPause } from "./commands/pause.js";
+import { registerProjects } from "./commands/projects.js";
+import { registerResume } from "./commands/resume.js";
 import { registerStart, type ChatStateStore } from "./commands/start.js";
-import { allowlistMiddleware } from "./middleware/allowlist.js";
+import { registerStatus } from "./commands/status.js";
+import { registerStop } from "./commands/stop.js";
+import { registerUse } from "./commands/use.js";
+import { registerConfirmationCallbacks } from "./handlers/callback.js";
+import { registerText } from "./handlers/text.js";
+import { UNAUTHORIZED_TEXT, allowlistMiddleware } from "./middleware/allowlist.js";
 import { TelegramStatus } from "./status.js";
 
 export const POLL_TIMEOUT_SECONDS = 30;
@@ -11,6 +22,15 @@ export const POLL_LIMIT = 100;
 export const ALLOWED_UPDATES = ["message", "callback_query"] as const;
 const BACKOFF_BASE_MS = 1_000;
 const BACKOFF_MAX_MS = 60_000;
+
+/** Dependencies of the feature handlers; absent in tests that only exercise the base bot. */
+export interface BotHandlerDeps {
+  readonly registry: Pick<ProjectRegistry, "list">;
+  readonly select: SelectProjectDeps;
+  readonly submit: SubmitTaskDeps;
+  readonly control: SessionControlDeps;
+  readonly confirmations: Pick<ConfirmationService, "answer">;
+}
 
 export interface CreateBotOptions {
   readonly token: string;
@@ -21,26 +41,83 @@ export interface CreateBotOptions {
   readonly rejectionWindowMs?: number;
   readonly maxTrackedSenders?: number;
   readonly now?: () => number;
+  readonly handlers?: BotHandlerDeps;
 }
 
 /**
- * Builds the bot. The allowlist is registered first, before any command (architecture §7.1).
- * Later work packages register their own handlers on the returned instance.
+ * Builds the bot. The allowlist is registered first, before any command (architecture §7.1), and
+ * every other handler strictly after it, so an update from a sender outside the allowlist never
+ * reaches a handler and causes no OpenHands call.
+ *
+ * Group chats: a sender must be allowlisted whatever the chat type, and state is keyed by chat id,
+ * so a group has its own single active project and binding. Confirmation taps are stricter: only a
+ * private chat with the tapping user may answer (see `registerConfirmationCallbacks`).
  */
 export function createBot(options: CreateBotOptions): Bot<Context> {
   const bot = new Bot<Context>(options.token);
-  bot.use(
-    allowlistMiddleware({
-      allowedUserIds: options.allowedUserIds,
-      logger: options.logger,
-      ...(options.allowlistSalt !== undefined ? { salt: options.allowlistSalt } : {}),
-      ...(options.rejectionWindowMs !== undefined ? { rejectionWindowMs: options.rejectionWindowMs } : {}),
-      ...(options.maxTrackedSenders !== undefined ? { maxTrackedSenders: options.maxTrackedSenders } : {}),
-      ...(options.now !== undefined ? { now: options.now } : {}),
-    }),
-  );
+  const allowlist = allowlistMiddleware({
+    allowedUserIds: options.allowedUserIds,
+    logger: options.logger,
+    ...(options.allowlistSalt !== undefined ? { salt: options.allowlistSalt } : {}),
+    ...(options.rejectionWindowMs !== undefined ? { rejectionWindowMs: options.rejectionWindowMs } : {}),
+    ...(options.maxTrackedSenders !== undefined ? { maxTrackedSenders: options.maxTrackedSenders } : {}),
+    ...(options.now !== undefined ? { now: options.now } : {}),
+  });
+  bot.use(async (ctx, next) => {
+    const tap = ctx.update.callback_query;
+    if (tap !== undefined && !options.allowedUserIds.has(tap.from.id)) {
+      // The allowlist throttles its replies and stays silent in groups, which would leave the
+      // tapper's button spinning. A callback toast is private to the tapper, so every unauthorized
+      // tap is answered here, never passed on, and logged without any identifier.
+      options.logger.warn("Rejected callback from a user outside the allowlist", {
+        event: "telegram.callback.rejected",
+      });
+      try {
+        await ctx.answerCallbackQuery({ text: UNAUTHORIZED_TEXT });
+      } catch (error) {
+        options.logger.warn("Could not deliver the unauthorized reply", {
+          event: "telegram.update.reject_reply_failed",
+          err_type: error instanceof Error ? error.name : typeof error,
+        });
+      }
+      return;
+    }
+    await allowlist(ctx, next);
+  });
+  bot.catch((error) => {
+    // Only the event name and the error type: the update, the error message and its cause can
+    // carry user text, the bot token or request URLs.
+    options.logger.error("Telegram update handler failed", {
+      event: "telegram.handler_failed",
+      err_type: error.error instanceof Error ? error.error.name : typeof error.error,
+    });
+  });
   registerStart(bot, options.chatState);
   registerHelp(bot);
+  const handlers = options.handlers;
+  if (handlers !== undefined) {
+    const { logger } = options;
+    registerProjects(bot, handlers.registry, logger);
+    registerUse(bot, handlers.select, logger);
+    registerStatus(bot, handlers.control, logger);
+    registerPause(bot, handlers.control, logger);
+    registerResume(bot, handlers.control, logger);
+    registerStop(bot, handlers.control, logger);
+    registerConfirmationCallbacks(bot, { confirmations: handlers.confirmations, logger });
+    // Text must come after the commands: it passes any "/..." message on, never consumes it.
+    registerText(bot, handlers.submit, logger);
+    // Last resort: a tap that no handler recognised (stale button, old keyboard) must not spin.
+    bot.on("callback_query", async (ctx) => {
+      try {
+        await ctx.answerCallbackQuery();
+      } catch (error) {
+        logger.warn("answerCallbackQuery failed", {
+          event: "telegram.callback_answer_failed",
+          err_type: error instanceof Error ? error.name : typeof error,
+        });
+      }
+    });
+  }
   return bot;
 }
 
