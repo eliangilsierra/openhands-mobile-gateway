@@ -611,3 +611,66 @@ describe("completion is order independent (CR-5)", () => {
     expect(texts([finish(), other])).toEqual(["✅ Tarea completada: Done: fixed X"]);
   });
 });
+
+describe("final review round (N1, N2, N4, P11, CR-10)", () => {
+  const hidden = (input: string, secret: string): void => {
+    const out = sanitizeDetail(input, 4096);
+    expect(out).toContain("[redacted]");
+    expect(out).not.toContain(secret);
+  };
+
+  it("a repeated keyword stays linear at the largest maxLength", () => {
+    const input = j("tok", "en").repeat(13_000);
+    const start = performance.now();
+    sanitizeDetail(input, 4096);
+    expect(performance.now() - start).toBeLessThan(1500);
+  });
+
+  it("redacts unquoted name:value", () => {
+    hidden(j("api_", "key", ":abcd1234efgh"), "abcd1234efgh");
+    hidden(j("tok", "en:Zx9Qw7Lm2Pq"), "Zx9Qw7Lm2Pq");
+  });
+
+  it("redacts quoted values that contain spaces completely", () => {
+    for (const input of [
+      j("pass", 'word="correct horse battery staple"'),
+      j("pass", "word='correct horse battery staple'"),
+      j('"pass', 'word": "a b c d"'),
+      j("API_", "KEY", '="alpha beta gamma"'),
+    ]) {
+      // A JSON key keeps its opening quote; everything else, spaces included, is gone.
+      expect(sanitizeDetail(input, 4096).replace(/^"/, "")).toBe("[redacted]");
+    }
+    expect(sanitizeDetail(j("pass", 'word="correct horse" and then more words'))).toBe("[redacted] and then more words");
+  });
+
+  it("redacts URL userinfo, curl -u and cookies", () => {
+    hidden("clone https://deploy:hunter2pw@example.com/repo.git now", "hunter2pw");
+    hidden("curl -s -u admin:hunter2pw https://example.com/api", "hunter2pw");
+    hidden("curl --user admin:hunter2pw https://example.com/api", "hunter2pw");
+    hidden("Cookie: sid=abc123def456; theme=dark", "abc123def456");
+    hidden("Set-Cookie: auth=Zx9Qw7Lm2Pq; Path=/", "Zx9Qw7Lm2Pq");
+    hidden("session=abcd1234efgh5678 expired", "abcd1234efgh5678");
+  });
+
+  it("does not over-redact look-alikes", () => {
+    for (const text of [
+      "see https://example.com:8080/path/a@b",
+      "open http://localhost:3000/ui",
+      "curl -u admin https://example.com",
+      "curl -s https://example.com/health",
+      "the Cookie: banner is shown",
+      "session=active and session expired",
+      "ssh://github.com:22/org/repo.git",
+    ]) {
+      expect(sanitizeDetail(text)).toBe(text);
+    }
+  });
+
+  it("does not leave half a surrogate pair when cutting at the cap", () => {
+    const input = `x${" ".repeat(158)}😀tail`; // high surrogate exactly at index cap - 1 for maxLength 10
+    const out = sanitizeDetail(input, 10);
+    expect(out).toBe("x");
+    expect(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(out)).toBe(false);
+  });
+});

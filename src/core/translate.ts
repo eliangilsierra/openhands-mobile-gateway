@@ -73,7 +73,8 @@ function ci(word: string): string {
 
 const VALUE = `[^\\s"',}]`;
 const NOT_YET_REDACTED = `(?!\\[redacted\\])`;
-const NAME_TAIL = `[A-Za-z0-9_.-]*`;
+// Bounded: an unbounded tail makes a repeated keyword (tokentokentoken...) quadratic.
+const NAME_TAIL = `[A-Za-z0-9_.-]{0,64}`;
 const KEYWORD =
   `(?:${ci("api")}[_-]?${ci("key")}|${ci("token")}|${ci("secret")}|${ci("passw")}(?:${ci("or")})?${ci("d")}` +
   `|${ci("authorization")}|${ci("credential")}|${ci("session")}[_-]?${ci("key")}|${ci("private")}[_-]?${ci("key")})`;
@@ -104,6 +105,19 @@ const SECRET_PATTERNS: readonly RegExp[] = [
   /(?:AKIA|ASIA)[0-9A-Z]{16}/g,
   // name=value, "name": "value", name:value and "name: value" with a secret-looking value;
   // the name may carry any prefix/suffix (OPENAI_API_KEY, AWS_SECRET_ACCESS_KEY, the gateway session key header).
+  // Quoted values may contain spaces: redact up to the closing quote (must precede the generic forms).
+  new RegExp(`${KEYWORD}${NAME_TAIL}["']?[ \\t]*[=:][ \\t]*"${NOT_YET_REDACTED}[^"]{4,256}"`, "g"),
+  new RegExp(`${KEYWORD}${NAME_TAIL}["']?[ \\t]*[=:][ \\t]*'${NOT_YET_REDACTED}[^']{4,256}'`, "g"),
+  // URL userinfo (scheme://user:pw@host): only the credentials are replaced.
+  /(?<=[A-Za-z][A-Za-z0-9+.-]{1,15}:\/\/)[^\s:/@"']{1,64}:[^\s@/"']{1,128}@/g,
+  // curl -u user:pw / --user user:pw.
+  /\bcurl\b[^\n|;&]{0,200}?[ \t](?:-u|--user)[ \t]+[^\s:]{1,64}:\S{1,128}/g,
+  // Cookie / Set-Cookie header values (name=value pairs) and session ids that contain a digit.
+  new RegExp(`${ci("cookie")}[ \\t]*:[ \\t]*${NOT_YET_REDACTED}(?:[A-Za-z0-9_.-]{1,64}=[^\\s;"']{1,512}(?:;[ \\t]*)?){1,16}`, "g"),
+  new RegExp(
+    `${NOT_WORD_BEFORE}${ci("session")}(?:[_-]?${ci("id")})?[ \\t]*=[ \\t]*${NOT_YET_REDACTED}(?=[^\\s"',}]*[0-9])${VALUE}{8,}`,
+    "g",
+  ),
   new RegExp(`${KEYWORD}${NAME_TAIL}["']?[ \\t]*=[ \\t]*["']?${NOT_YET_REDACTED}${VALUE}{4,}`, "g"),
   new RegExp(`${KEYWORD}${NAME_TAIL}["']?[ \\t]*:[ \\t]*["']${NOT_YET_REDACTED}${VALUE}{4,}`, "g"),
   new RegExp(`${KEYWORD}${NAME_TAIL}["']?:${NOT_YET_REDACTED}[^\\s"',}:]{4,}`, "g"),
@@ -125,6 +139,13 @@ const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu;
 const HIDING_CHARS = new RegExp(`${STRIP_CHARS.source}|${INVISIBLE_CHARS.source}|${CONTROL_CHARS.source}`, "u");
 // Unicode dashes that NFKC leaves alone; only treated as "-" while looking for a secret.
 const DASH_CHARS = /[\u2010-\u2015\u2212\u2043\ufe58\ufe63]/u;
+
+/** Cuts to `max` UTF-16 units without leaving half of a surrogate pair at the end. */
+function cutUnits(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const code = text.charCodeAt(max - 1);
+  return text.slice(0, code >= 0xd800 && code <= 0xdbff ? max - 1 : max);
+}
 
 function redact(text: string): string {
   let out = text;
@@ -186,7 +207,7 @@ export function sanitizeDetail(value: string, maxLength: number = MAX_DETAIL_LEN
   const cap = limit * INPUT_FACTOR;
   // Cut FIRST (before normalisation and every regex), then canonicalise: NFKC folds fullwidth and
   // compatibility letters onto ASCII so they cannot dodge the patterns.
-  const normalised = value.slice(0, cap).normalize("NFKC").slice(0, cap);
+  const normalised = cutUnits(cutUnits(value, cap).normalize("NFKC"), cap);
   // Redact BEFORE cleaning so invisible characters and line breaks cannot hide a secret.
   const stripped = redactSplitSecrets(normalised);
   const text = redact(
