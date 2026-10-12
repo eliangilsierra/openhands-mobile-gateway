@@ -280,3 +280,165 @@ async function createAndBind(
   });
   return { status };
 }
+
+/**
+ * Session controls (architecture §7.1 command table, FR-5): status, pause, resume and stop act on the
+ * chat's active binding. Only validated OpenHands calls are made: `GET /api/conversations/{id}` (4),
+ * `POST .../run` (7), `POST .../pause` (8) and `POST .../interrupt` (9). There is no upstream
+ * "resume" route; resume is `run`. None of them deletes the conversation.
+ */
+
+export interface SessionControlDeps {
+  readonly chatState: Pick<ChatStateRepository, "getActiveProject">;
+  readonly bindings: Pick<ConversationBindingRepository, "findActive">;
+  readonly client: Pick<
+    OpenHandsRestClient,
+    "getConversation" | "pauseConversation" | "runConversation" | "interruptConversation"
+  >;
+  readonly logger?: Logger;
+  /** Keeps the event subscriber's idle timer in step with the conversation (`EventSubscriber.setTerminal`). */
+  readonly setTerminal?: (conversationId: string, terminal: boolean) => void;
+}
+
+/**
+ * `ConversationExecutionStatus` as reported by `GET /api/conversations/{id}`. This is the agent's
+ * execution status, never the runtime (sandbox) status (R2-F14); `unknown` covers a missing or
+ * unrecognised value, which is never echoed back to the user.
+ */
+export type ExecutionStatus =
+  | "idle"
+  | "running"
+  | "paused"
+  | "waiting_for_confirmation"
+  | "finished"
+  | "error"
+  | "stuck"
+  | "unknown";
+
+const EXECUTION_STATUSES: ReadonlySet<string> = new Set([
+  "idle",
+  "running",
+  "paused",
+  "waiting_for_confirmation",
+  "finished",
+  "error",
+  "stuck",
+]);
+
+const TERMINAL_STATUSES: ReadonlySet<ExecutionStatus> = new Set(["finished", "error", "stuck"]);
+
+export function normalizeExecutionStatus(value: unknown): ExecutionStatus {
+  return typeof value === "string" && EXECUTION_STATUSES.has(value) ? (value as ExecutionStatus) : "unknown";
+}
+
+export type SessionControlFailure =
+  | { readonly status: "no_active_binding" }
+  /** The conversation no longer exists upstream. */
+  | { readonly status: "conversation_gone" }
+  | { readonly status: "unavailable" }
+  /** A POST may have been processed (timeout, 502/504). Do not assume it failed. */
+  | { readonly status: "outcome_unknown" }
+  | { readonly status: "auth_error" }
+  | { readonly status: "already_running" }
+  | { readonly status: "error" };
+
+export type GetStatusResult =
+  | { readonly status: "ok"; readonly executionStatus: ExecutionStatus }
+  | SessionControlFailure;
+export type SessionControlResult = { readonly status: "ok" } | SessionControlFailure;
+
+function controlFailure(error: unknown, logger: Logger | undefined, action: string): SessionControlFailure {
+  if (error instanceof NotFoundError) {
+    logger?.warn("Conversation not found upstream", { event: "session.control_gone", action });
+    return { status: "conversation_gone" };
+  }
+  const mapped = failureFor(error, logger);
+  switch (mapped.status) {
+    case "auth_error":
+    case "already_running":
+    case "unavailable":
+    case "outcome_unknown":
+      return { status: mapped.status };
+    default:
+      return { status: "error" };
+  }
+}
+
+function findBinding(deps: SessionControlDeps, target: Target): ConversationBinding | null {
+  const projectKey = deps.chatState.getActiveProject(target.channel, target.externalChatId);
+  if (projectKey === null) {
+    return null;
+  }
+  return deps.bindings.findActive(target.channel, target.externalChatId, projectKey);
+}
+
+function markTerminal(deps: SessionControlDeps, conversationId: string, terminal: boolean): void {
+  try {
+    deps.setTerminal?.(conversationId, terminal);
+  } catch (error) {
+    deps.logger?.warn("Could not update the subscription state", {
+      event: "session.set_terminal_failed",
+      err_type: error instanceof Error ? error.name : typeof error,
+    });
+  }
+}
+
+async function control(
+  deps: SessionControlDeps,
+  target: Target,
+  action: "pause" | "resume" | "stop",
+  call: (id: string) => Promise<unknown>,
+  after?: (id: string) => void,
+): Promise<SessionControlResult> {
+  try {
+    const binding = findBinding(deps, target);
+    if (binding === null) {
+      return { status: "no_active_binding" };
+    }
+    await call(binding.conversationId);
+    after?.(binding.conversationId);
+    deps.logger?.info("Session control applied", { event: "session.control", action, channel: target.channel });
+    return { status: "ok" };
+  } catch (error) {
+    return controlFailure(error, deps.logger, action);
+  }
+}
+
+/** `/status`: the conversation's execution status. */
+export async function getStatus(deps: SessionControlDeps, target: Target): Promise<GetStatusResult> {
+  try {
+    const binding = findBinding(deps, target);
+    if (binding === null) {
+      return { status: "no_active_binding" };
+    }
+    const info = await deps.client.getConversation(binding.conversationId);
+    const executionStatus = normalizeExecutionStatus(info.execution_status);
+    if (executionStatus !== "unknown") {
+      markTerminal(deps, binding.conversationId, TERMINAL_STATUSES.has(executionStatus));
+    }
+    return { status: "ok", executionStatus };
+  } catch (error) {
+    return controlFailure(error, deps.logger, "status");
+  }
+}
+
+/** `/pause`: `POST /api/conversations/{id}/pause`. */
+export function pauseTask(deps: SessionControlDeps, target: Target): Promise<SessionControlResult> {
+  return control(deps, target, "pause", (id) => deps.client.pauseConversation(id));
+}
+
+/** `/resume`: `POST /api/conversations/{id}/run` (no `/resume` route exists upstream, R2-F8). */
+export function resumeTask(deps: SessionControlDeps, target: Target): Promise<SessionControlResult> {
+  return control(
+    deps,
+    target,
+    "resume",
+    (id) => deps.client.runConversation(id),
+    (id) => markTerminal(deps, id, false),
+  );
+}
+
+/** `/stop`: `POST /api/conversations/{id}/interrupt`. Parks the conversation; never deletes it (FR-8). */
+export function stopTask(deps: SessionControlDeps, target: Target): Promise<SessionControlResult> {
+  return control(deps, target, "stop", (id) => deps.client.interruptConversation(id));
+}
