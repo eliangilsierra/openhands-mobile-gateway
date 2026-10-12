@@ -2,8 +2,13 @@ import { Bot } from "grammy";
 import type { Context } from "grammy";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  CHUNK_FAILURE_NOTE,
   DEFAULT_MAX_CHUNKS,
+  IDLE_CHAT_TTL_MS,
+  MAX_BODY_CHARS,
   MAX_MESSAGE_LENGTH,
+  MAX_QUEUED_JOBS,
+  MAX_RETRY_AFTER_SECONDS,
   Notifier,
   splitText,
   type OutboundNotification,
@@ -34,7 +39,10 @@ interface Harness {
   readonly logs: ReturnType<typeof createRecordingLogger>;
 }
 
-function setup(respond: (call: ApiCall, n: number) => ApiResult = ok, maxChunks?: number): Harness {
+function setup(
+  respond: (call: ApiCall, n: number) => ApiResult | Promise<ApiResult> = ok,
+  maxChunks?: number,
+): Harness {
   const bot = new Bot<Context>("123456:TEST_TOKEN_NOT_REAL_xxxxxxxxxxxxxxxxxx", {
     botInfo: undefined as never,
   });
@@ -263,6 +271,10 @@ describe("markup safety (T-AC-3, T-B1-6)", () => {
       expect(call.payload).not.toHaveProperty("entities");
       expect(call.payload).not.toHaveProperty("caption_entities");
       expect(Object.keys(call.payload).some((key) => key.includes("parse_mode"))).toBe(false);
+      if (call.method !== "sendDocument") {
+        // F1: no server-side link preview; still plain text (no parse_mode / entities).
+        expect(call.payload["link_preview_options"]).toEqual({ is_disabled: true });
+      }
     }
     // First message and the edit carry the hostile text unchanged (no escaping, no rewriting).
     expect(s[0]?.payload["text"]).toBe("[x](http://e)");
@@ -381,5 +393,183 @@ describe("errors (T-AC-5)", () => {
     notifier.enqueue(out("after", { terminal: true }));
     await vi.advanceTimersByTimeAsync(5000);
     expect(sends(calls)).toHaveLength(0);
+  });
+});
+
+/** Text of the Buffer behind a document upload (grammY keeps it in `InputFile.fileData`). */
+function documentText(call: ApiCall | undefined): string {
+  const doc: unknown = call?.payload["document"];
+  if (typeof doc === "object" && doc !== null && "fileData" in doc && Buffer.isBuffer(doc.fileData)) {
+    return doc.fileData.toString("utf8");
+  }
+  throw new Error("not a buffer-backed document");
+}
+
+describe("queue overflow keeps the in-flight job (review: CR MEDIUM)", () => {
+  it("evicts the oldest queued job, not the one being sent, so its retry is not lost", async () => {
+    let releaseFirst: (() => void) | undefined;
+    const { notifier, calls, logs } = setup(async (_call, n): Promise<ApiResult> => {
+      if (n === 0) {
+        await new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+        return { ok: false, error_code: 500, description: "Internal Server Error" };
+      }
+      return ok();
+    });
+    notifier.enqueue(out("job-0", { terminal: true }));
+    await vi.advanceTimersByTimeAsync(0); // job-0 is now in flight
+    for (let i = 1; i <= MAX_QUEUED_JOBS; i++) {
+      notifier.enqueue(out(`job-${String(i)}`, { terminal: true }));
+    }
+    expect(notifier.pending(CHAT)).toBe(MAX_QUEUED_JOBS);
+    releaseFirst?.();
+    await vi.advanceTimersByTimeAsync(600_000);
+
+    const texts = sends(calls).map((c) => c.payload["text"]);
+    expect(texts.filter((t) => t === "job-0")).toHaveLength(2); // failed once, retried and delivered
+    expect(texts).not.toContain("job-1"); // the oldest QUEUED job is the one dropped
+    expect(texts).toContain("job-2");
+    expect(texts).toContain(`job-${String(MAX_QUEUED_JOBS)}`);
+    expect(logs.records.filter((r) => r.fields?.["event"] === "notify.dropped")).toHaveLength(1);
+  });
+});
+
+describe("a dropped chunk does not leave a silent gap (review: CR MEDIUM)", () => {
+  it("drops the rest of the group and sends a fixed failure note instead", async () => {
+    const { notifier, calls } = setup((call) =>
+      typeof call.payload["text"] === "string" && call.payload["text"].startsWith("(2/3)")
+        ? { ok: false, error_code: 500, description: "Internal Server Error" }
+        : ok(),
+    );
+    notifier.enqueue(out("z".repeat(11_000), { terminal: true }));
+    notifier.enqueue(out("after", { terminal: true }));
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    const texts = sends(calls).map((c) => String(c.payload["text"]));
+    expect(texts.map((t) => t.slice(0, 5))).toEqual(["(1/3)", "(2/3)", "(2/3)", "(2/3)", CHUNK_FAILURE_NOTE.slice(0, 5), "after"]);
+    expect(texts.some((t) => t.startsWith("(3/3)"))).toBe(false);
+    expect(texts[4]).toBe(CHUNK_FAILURE_NOTE);
+    expect(notifier.pending(CHAT)).toBe(0);
+  });
+});
+
+describe("bounded memory (review: security F3)", () => {
+  it.each([
+    ["log", "l".repeat(MAX_BODY_CHARS * 3), "log" as const],
+    ["oversized text", "x".repeat(MAX_BODY_CHARS * 3), "text" as const],
+  ])("caps a huge %s body and says it was cut", async (_name, body, kind) => {
+    const { notifier, calls } = setup();
+    notifier.enqueue(out(body, { terminal: true, contentKind: kind }));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sends(calls).map((c) => c.method)).toEqual(["sendDocument"]);
+    const text = documentText(sends(calls)[0]);
+    expect(text.length).toBeLessThan(MAX_BODY_CHARS + 100);
+    expect(text.length).toBeGreaterThan(MAX_BODY_CHARS);
+    expect(text.endsWith("[… salida truncada]")).toBe(true);
+  });
+
+  it("does not cut a body at exactly the cap", async () => {
+    const { notifier, calls } = setup();
+    notifier.enqueue(out("y".repeat(MAX_BODY_CHARS), { terminal: true, contentKind: "log" }));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(documentText(sends(calls)[0])).toBe("y".repeat(MAX_BODY_CHARS));
+  });
+
+  it("forgets idle chats (but not ones still pacing) when a new chat appears", async () => {
+    const { notifier } = setup();
+    for (let chat = 1000; chat < 1050; chat++) {
+      notifier.enqueue({ ...out("hi", { terminal: true }), chatId: chat });
+    }
+    await vi.advanceTimersByTimeAsync(0);
+    expect(notifier.trackedChats()).toBe(50);
+    notifier.enqueue({ ...out("new", { terminal: true }), chatId: 2000 }); // all still pacing: nothing forgotten
+    expect(notifier.trackedChats()).toBe(51);
+    await vi.advanceTimersByTimeAsync(5000);
+    notifier.enqueue({ ...out("newer", { terminal: true }), chatId: 3000 });
+    expect(notifier.trackedChats()).toBe(1);
+  });
+
+  it("keeps a live status for a while, then forgets it", async () => {
+    const { notifier } = setup();
+    notifier.enqueue(out("working"));
+    await vi.advanceTimersByTimeAsync(2000);
+    notifier.enqueue({ ...out("other", { terminal: true }), chatId: OTHER_CHAT });
+    expect(notifier.trackedChats()).toBe(2); // live status of CHAT kept, so the next progress edits it
+    await vi.advanceTimersByTimeAsync(IDLE_CHAT_TTL_MS + 5000);
+    notifier.enqueue({ ...out("later", { terminal: true }), chatId: 3000 });
+    expect(notifier.trackedChats()).toBe(1);
+  });
+});
+
+describe("retry_after is validated and clamped (review: security F4)", () => {
+  /** Milliseconds after the 429 at which the message is resent (stepped: 100 ms, then 100 s). */
+  async function resendDelay(retryAfter: number): Promise<number> {
+    let first = true;
+    const { notifier, calls } = setup((call) => {
+      if (call.method === "sendMessage" && first) {
+        first = false;
+        return { ok: false, error_code: 429, description: "Too Many Requests", parameters: { retry_after: retryAfter } };
+      }
+      return ok();
+    });
+    notifier.enqueue(out("hello", { terminal: true }));
+    await vi.advanceTimersByTimeAsync(0);
+    let elapsed = 0;
+    while (elapsed < 4_000_000) {
+      const step = elapsed < 10_000 ? 100 : 100_000;
+      await vi.advanceTimersByTimeAsync(step);
+      elapsed += step;
+      if (sends(calls).length === 2) {
+        return elapsed;
+      }
+    }
+    return Number.POSITIVE_INFINITY;
+  }
+
+  it("clamps an absurd value to the ceiling", async () => {
+    const delay = await resendDelay(1e9);
+    expect(delay).toBeGreaterThanOrEqual(MAX_RETRY_AFTER_SECONDS * 1000 - 100_000);
+    expect(delay).toBeLessThanOrEqual(MAX_RETRY_AFTER_SECONDS * 1000 + 200_000);
+  });
+
+  it.each([Number.NaN, 0, -5, Number.POSITIVE_INFINITY])("treats %s as a 1 s wait, not an instant retry", async (value) => {
+    const delay = await resendDelay(value);
+    expect(delay).toBeGreaterThanOrEqual(900);
+    expect(delay).toBeLessThanOrEqual(1100);
+  });
+});
+
+describe("stop() (review: CR LOW)", () => {
+  it("clears timers and drops queued jobs without calling the API", async () => {
+    const { notifier, calls } = setup();
+    notifier.enqueue(out("a", { terminal: true }));
+    notifier.enqueue(out("b", { terminal: true }));
+    expect(vi.getTimerCount()).toBe(1);
+    expect(notifier.pending(CHAT)).toBe(2);
+    notifier.stop();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(notifier.pending(CHAT)).toBe(0);
+    expect(notifier.trackedChats()).toBe(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(sends(calls)).toHaveLength(0);
+  });
+
+  it("lets an in-flight send finish but schedules nothing afterwards", async () => {
+    let release: (() => void) | undefined;
+    const { notifier, calls } = setup(async () => {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return ok();
+    });
+    notifier.enqueue(out("a", { terminal: true }));
+    notifier.enqueue(out("b", { terminal: true }));
+    await vi.advanceTimersByTimeAsync(0);
+    notifier.stop();
+    release?.();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(sends(calls).map((c) => c.payload["text"])).toEqual(["a"]);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
