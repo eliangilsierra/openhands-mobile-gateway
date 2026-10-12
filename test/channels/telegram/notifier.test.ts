@@ -435,6 +435,117 @@ describe("queue overflow keeps the in-flight job (review: CR MEDIUM)", () => {
   });
 });
 
+describe("queue overflow with chunked bodies (QA cycle 2: F-1, F-2)", () => {
+  const chunkTags = (texts: readonly string[]): string[] =>
+    texts.filter((t) => /^\(\d\/\d\) /.test(t)).map((t) => t.slice(0, 5));
+
+  it("keeps the in-flight chunk (and its retry), drops the rest of the group and sends the note once", async () => {
+    let releaseFirst: (() => void) | undefined;
+    const { notifier, calls } = setup(async (_call, n): Promise<ApiResult> => {
+      if (n === 0) {
+        await new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+        return { ok: false, error_code: 500, description: "Internal Server Error" };
+      }
+      return ok();
+    });
+    notifier.enqueue(out("z".repeat(11_000), { terminal: true })); // (1/3) (2/3) (3/3)
+    await vi.advanceTimersByTimeAsync(0); // (1/3) is now in flight
+    for (let i = 0; i < MAX_QUEUED_JOBS; i++) {
+      notifier.enqueue(out(`f${String(i)}`, { terminal: true }));
+      expect(notifier.pending(CHAT)).toBeLessThanOrEqual(MAX_QUEUED_JOBS);
+    }
+    releaseFirst?.();
+    await vi.advanceTimersByTimeAsync(600_000);
+
+    const texts = sends(calls).map((c) => String(c.payload["text"]));
+    expect(chunkTags(texts)).toEqual(["(1/3)", "(1/3)"]); // failed once, retried, delivered; (2/3) (3/3) dropped
+    expect(texts.filter((t) => t === CHUNK_FAILURE_NOTE)).toHaveLength(1);
+    expect(texts.indexOf(CHUNK_FAILURE_NOTE)).toBeGreaterThan(texts.lastIndexOf(texts.find((t) => t.startsWith("(1/3)")) ?? ""));
+    expect(texts).toContain(`f${String(MAX_QUEUED_JOBS - 1)}`);
+    expect(notifier.pending(CHAT)).toBe(0);
+  });
+
+  it("never evicts the failure note, and sends it once, while the cap keeps dropping other jobs", async () => {
+    const { notifier, calls } = setup();
+    notifier.enqueue(out("z".repeat(11_000), { terminal: true })); // idle: three queued chunks
+    for (let i = 0; i < MAX_QUEUED_JOBS + 50; i++) {
+      notifier.enqueue(out(`f${String(i)}`, { terminal: true }));
+    }
+    expect(notifier.pending(CHAT)).toBe(MAX_QUEUED_JOBS);
+    await vi.advanceTimersByTimeAsync(600_000);
+
+    const texts = sends(calls).map((c) => String(c.payload["text"]));
+    expect(chunkTags(texts)).toEqual([]); // the whole group was dropped, not just its first chunk
+    expect(texts.filter((t) => t === CHUNK_FAILURE_NOTE)).toHaveLength(1);
+    expect(texts[0]).toBe(CHUNK_FAILURE_NOTE); // still in the place of the oldest dropped chunk
+    expect(texts).toContain(`f${String(MAX_QUEUED_JOBS + 49)}`);
+    expect(notifier.pending(CHAT)).toBe(0);
+  });
+
+  it("drops the whole group on a single overflow, not only as many chunks as the cap needs", async () => {
+    const { notifier, calls } = setup();
+    notifier.enqueue(out("z".repeat(11_000), { terminal: true })); // 3 queued chunks
+    for (let i = 0; i < MAX_QUEUED_JOBS - 3 + 1; i++) {
+      notifier.enqueue(out(`f${String(i)}`, { terminal: true })); // the last one overflows
+    }
+    await vi.advanceTimersByTimeAsync(600_000);
+
+    const texts = sends(calls).map((c) => String(c.payload["text"]));
+    expect(chunkTags(texts)).toEqual([]);
+    expect(texts.filter((t) => t === CHUNK_FAILURE_NOTE)).toHaveLength(1);
+  });
+
+  it("sends one note when a group loses a chunk to overflow and its in-flight chunk then fails for good", async () => {
+    let releaseFirst: (() => void) | undefined;
+    const { notifier, calls } = setup(async (call, n): Promise<ApiResult> => {
+      if (typeof call.payload["text"] === "string" && call.payload["text"].startsWith("(1/3)")) {
+        if (n === 0) {
+          await new Promise<void>((resolve) => {
+            releaseFirst = resolve;
+          });
+        }
+        return { ok: false, error_code: 500, description: "Internal Server Error" };
+      }
+      return ok();
+    });
+    notifier.enqueue(out("z".repeat(11_000), { terminal: true }));
+    await vi.advanceTimersByTimeAsync(0);
+    for (let i = 0; i < MAX_QUEUED_JOBS; i++) {
+      notifier.enqueue(out(`f${String(i)}`, { terminal: true }));
+    }
+    releaseFirst?.();
+    await vi.advanceTimersByTimeAsync(600_000);
+
+    const texts = sends(calls).map((c) => String(c.payload["text"]));
+    expect(chunkTags(texts)).toEqual(["(1/3)", "(1/3)", "(1/3)"]);
+    expect(texts.filter((t) => t === CHUNK_FAILURE_NOTE)).toHaveLength(1);
+  });
+
+  it("removes exactly the job that was sent, even if the queue head changed meanwhile", async () => {
+    let releaseFirst: (() => void) | undefined;
+    const { notifier, calls } = setup(async (_call, n): Promise<ApiResult> => {
+      if (n === 0) {
+        await new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+      }
+      return ok();
+    });
+    notifier.enqueue(out("sent", { terminal: true }));
+    await vi.advanceTimersByTimeAsync(0); // "sent" is in flight
+    // White-box: put a foreign job in front, as a future queue bug would, to pin identity removal.
+    const internals = notifier as unknown as { chats: Map<string, { jobs: unknown[] }> };
+    internals.chats.get(String(CHAT))?.jobs.unshift({ kind: "text", text: "foreign", attempts: 0 });
+    releaseFirst?.();
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    const texts = sends(calls).map((c) => c.payload["text"]);
+    expect(texts).toEqual(["sent", "foreign"]); // "sent" is not sent again, "foreign" is not lost
+  });
+});
+
 describe("a dropped chunk does not leave a silent gap (review: CR MEDIUM)", () => {
   it("drops the rest of the group and sends a fixed failure note instead", async () => {
     const { notifier, calls } = setup((call) =>

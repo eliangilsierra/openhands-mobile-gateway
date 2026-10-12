@@ -115,6 +115,11 @@ export function splitText(text: string, limit: number): string[] {
 
 // --- Queue ----------------------------------------------------------------------------------
 
+/** Shared by the chunks of one body; `noted` makes the failure note go out at most once per body. */
+interface ChunkGroup {
+  noted: boolean;
+}
+
 type Job =
   | { readonly kind: "progress"; readonly conversationId: string; lines: string[]; attempts: number }
   | {
@@ -122,7 +127,9 @@ type Job =
       readonly text: string;
       readonly terminalFor?: string;
       /** Chunks of one split body share a group: if one is dropped the rest must not be sent. */
-      readonly group?: symbol;
+      readonly group?: ChunkGroup;
+      /** The fixed failure note: never evicted by the queue cap while any other job can go instead. */
+      readonly isNote?: true;
       attempts: number;
     }
   | {
@@ -283,7 +290,7 @@ export class Notifier {
     if (pieces.length > this.maxChunks) {
       return [{ kind: "document", content: body, filename: "output.txt", attempts: 0, ...base }];
     }
-    const group = Symbol("chunk-group");
+    const group: ChunkGroup = { noted: false };
     return pieces.map((piece, i) => ({
       kind: "text" as const,
       text: `(${String(i + 1)}/${String(pieces.length)}) ${piece}`,
@@ -294,15 +301,36 @@ export class Notifier {
   }
 
   private push(chat: ChatQueue, job: Job): void {
-    if (chat.jobs.length >= MAX_QUEUED_JOBS) {
+    let evictedAny = false;
+    while (chat.jobs.length >= MAX_QUEUED_JOBS) {
       // jobs[0] is in flight while busy: it must stay (drainOne still handles its outcome).
-      const evicted = chat.jobs.splice(chat.busy ? 1 : 0, 1)[0];
-      if (evicted !== undefined) {
-        this.dropGroupRest(chat, evicted);
+      const first = chat.busy ? 1 : 0;
+      let index = chat.jobs.findIndex((other, i) => i >= first && !(other.kind === "text" && other.isNote === true));
+      if (index < 0) {
+        index = first; // only failure notes are left: the cap still wins
       }
+      const evicted = chat.jobs[index];
+      if (evicted === undefined) {
+        break;
+      }
+      evictedAny = true;
+      if (evicted.kind === "text" && evicted.group !== undefined && !evicted.group.noted) {
+        // No silent gap: the note takes the place of the dropped chunk, the rest of the group goes.
+        chat.jobs[index] = this.failureNote(evicted.group);
+        this.dropGroupRest(chat, evicted.group, chat.busy ? chat.jobs[0] : undefined);
+      } else {
+        chat.jobs.splice(index, 1);
+      }
+    }
+    if (evictedAny) {
       this.logger?.warn("notifier queue full, dropped oldest notification", { event: "notify.dropped", status: "queue_full" });
     }
     chat.jobs.push(job);
+  }
+
+  private failureNote(group: ChunkGroup): Job {
+    group.noted = true;
+    return { kind: "text", text: CHUNK_FAILURE_NOTE, isNote: true, attempts: 0 };
   }
 
   private schedule(chatId: number | string, chat: ChatQueue): void {
@@ -361,10 +389,10 @@ export class Notifier {
     job.attempts += 1;
     if (job.attempts >= MAX_SEND_ATTEMPTS) {
       const index = this.removeJob(chat, job);
-      if (job.kind === "text" && job.group !== undefined) {
-        // No silent gap: drop the rest of the long message and tell the chat, in fixed text.
-        this.dropGroupRest(chat, job);
-        chat.jobs.splice(Math.max(index, 0), 0, { kind: "text", text: CHUNK_FAILURE_NOTE, attempts: 0 });
+      if (job.kind === "text" && job.group !== undefined && !job.group.noted) {
+        // No silent gap: drop the rest of the long message and tell the chat, in fixed text (once).
+        this.dropGroupRest(chat, job.group, undefined);
+        chat.jobs.splice(Math.max(index, 0), 0, this.failureNote(job.group));
       }
       this.logger?.error("notification dropped after retries", {
         event: "notify.dropped",
@@ -389,12 +417,9 @@ export class Notifier {
     return index;
   }
 
-  /** Removes the still-queued chunks that share the dropped job's group. */
-  private dropGroupRest(chat: ChatQueue, dropped: Job): void {
-    if (dropped.kind !== "text" || dropped.group === undefined) {
-      return;
-    }
-    chat.jobs = chat.jobs.filter((other) => !(other.kind === "text" && other.group === dropped.group));
+  /** Removes the still-queued chunks of a group, except `keep` (the job being sent). */
+  private dropGroupRest(chat: ChatQueue, group: ChunkGroup, keep: Job | undefined): void {
+    chat.jobs = chat.jobs.filter((other) => other === keep || !(other.kind === "text" && other.group === group));
   }
 
   private async deliver(chatId: number | string, chat: ChatQueue, job: Job): Promise<void> {
