@@ -34,7 +34,7 @@ function ev(n: number, extra: Record<string, unknown> = {}): OpenHandsEvent {
   };
 }
 
-// ---- minimal RFC 6455 server (no `ws` dependency) ------------------------------------------
+// ---- minimal RFC 6455 test server (the subscriber under test uses the `ws` client) ------------------------------------------
 
 interface Conn {
   readonly url: string;
@@ -556,6 +556,68 @@ describe("lifecycle", () => {
     });
     await vi.waitFor(() => expect(ids(received)).toEqual(["e1"]));
     expect(logger.records.filter((r) => r.fields?.event === "ws.reconnect_scheduled").length).toBeGreaterThanOrEqual(3);
+  });
+});
+
+describe("backoff reset and poll timer cleanup", () => {
+  const delays = (): number[] =>
+    logger.records
+      .filter((r) => r.fields?.event === "ws.reconnect_scheduled")
+      .map((r) => Number(r.fields?.duration_ms));
+
+  it("grows the delay across consecutive failed opens", async () => {
+    server.refuseWs = true;
+    const { sub } = make({ random: () => 0.0099 });
+    sub.subscribe(CONV, () => undefined);
+    await vi.waitFor(() => expect(delays().length).toBeGreaterThanOrEqual(3));
+    expect(delays().slice(0, 3)).toEqual([9, 19, 39]);
+  });
+
+  it("resets the delay to the base after a successful open", async () => {
+    server.onConnection = (conn, i) => {
+      if (i < 2) setTimeout(() => conn.kill(), 20);
+      else conn.send(ev(1));
+    };
+    const received: OpenHandsEvent[] = [];
+    const { sub } = make({ random: () => 0.0099 });
+    sub.subscribe(CONV, (e) => {
+      received.push(e);
+    });
+    await vi.waitFor(() => expect(ids(received)).toEqual(["e1"]));
+    // Both drops happened after a successful open, so each starts again from attempt 0.
+    expect(delays().slice(0, 2)).toEqual([9, 9]);
+  });
+
+  // A long poll interval leaves one timer pending: only clearing it keeps the count still.
+  it("clears the pending poll timer once the socket opens", async () => {
+    server.refuseWs = true;
+    server.searchItems = [ev(1)];
+    const { sub, signals } = make({ eventPollSeconds: 0.3 });
+    sub.subscribe(CONV, () => undefined);
+    await vi.waitFor(() => expect(signals).toContainEqual({ openhandsApi: "unreachable" }));
+    await vi.waitFor(() => expect(server.searches.length).toBeGreaterThanOrEqual(1));
+
+    server.refuseWs = false;
+    await vi.waitFor(() => expect(signals).toContainEqual({ openhandsApi: "reachable" }));
+    const settled = server.searches.length;
+    await new Promise((r) => setTimeout(r, 450));
+    expect(server.searches.length).toBe(settled);
+  });
+
+  it("clears the pending poll timer when the subscription is stopped", async () => {
+    server.refuseWs = true;
+    server.searchItems = [ev(1)];
+    const { sub, signals } = make({ eventPollSeconds: 0.3 });
+    sub.subscribe(CONV, () => undefined);
+    await vi.waitFor(() => expect(signals).toContainEqual({ openhandsApi: "unreachable" }));
+    await vi.waitFor(() => expect(server.searches.length).toBeGreaterThanOrEqual(1));
+    // Let the first poll finish so that the next one is only a pending timer.
+    await new Promise((r) => setTimeout(r, 30));
+
+    sub.unsubscribe(CONV);
+    const settled = server.searches.length;
+    await new Promise((r) => setTimeout(r, 450));
+    expect(server.searches.length).toBe(settled);
   });
 });
 

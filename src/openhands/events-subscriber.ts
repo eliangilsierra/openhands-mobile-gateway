@@ -1,3 +1,4 @@
+import { WebSocket } from "ws";
 import type { ApiKeyStatus, OpenHandsApiStatus } from "../health.js";
 import type { Logger } from "../logger.js";
 import { AuthError } from "./errors.js";
@@ -43,7 +44,7 @@ export interface HealthSignal {
   readonly keyStatus?: ApiKeyStatus;
 }
 
-/** The subset of the WHATWG `WebSocket` the subscriber uses. */
+/** The subset of the `ws` `WebSocket` (ADR-0002) the subscriber uses. */
 export interface EventSocket {
   send(data: string): void;
   close(code?: number): void;
