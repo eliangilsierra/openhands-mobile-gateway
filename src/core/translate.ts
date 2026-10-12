@@ -109,7 +109,7 @@ const SECRET_PATTERNS: readonly RegExp[] = [
   new RegExp(`${KEYWORD}${NAME_TAIL}["']?[ \\t]*[=:][ \\t]*"${NOT_YET_REDACTED}[^"]{4,256}"`, "g"),
   new RegExp(`${KEYWORD}${NAME_TAIL}["']?[ \\t]*[=:][ \\t]*'${NOT_YET_REDACTED}[^']{4,256}'`, "g"),
   // URL userinfo (scheme://user:pw@host): only the credentials are replaced.
-  /(?<=[A-Za-z][A-Za-z0-9+.-]{1,15}:\/\/)[^\s:/@"']{1,64}:[^\s@/"']{1,128}@/g,
+  /(?<=[A-Za-z][A-Za-z0-9+.-]{1,15}:\/\/)[^\s:/?#@"']{1,64}:[^\s/?#"']{1,128}@/g,
   // curl -u user:pw / --user user:pw.
   /\bcurl\b[^\n|;&]{0,200}?[ \t](?:-u|--user)[ \t]+[^\s:]{1,64}:\S{1,128}/g,
   // Cookie / Set-Cookie header values (name=value pairs) and session ids that contain a digit.

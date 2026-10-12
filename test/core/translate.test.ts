@@ -653,6 +653,30 @@ describe("final review round (N1, N2, N4, P11, CR-10)", () => {
     hidden("session=abcd1234efgh5678 expired", "abcd1234efgh5678");
   });
 
+  it("redacts URL userinfo whose password contains a raw @", () => {
+    const scheme = "https" + "://";
+    const single = sanitizeDetail(`${scheme}svc:pa@ssw0rd@example.com/path`);
+    expect(single).toBe(`${scheme}[redacted]example.com/path`);
+    for (const tail of ["ssw0rd", "Mn3vBc4Kd5", "Qx7"]) {
+      const out = sanitizeDetail(`${scheme}svc:p@${tail}@host.example:8443/x?a=b@c`);
+      expect(out).not.toContain(tail);
+      expect(out).toBe(`${scheme}[redacted]host.example:8443/x?a=b@c`);
+    }
+    const multi = sanitizeDetail(`${scheme}svc:a@b@c@Zy9Xw8@example.com/`);
+    expect(multi).not.toContain("Zy9Xw8");
+    expect(multi).toBe(`${scheme}[redacted]example.com/`);
+  });
+
+  it("keeps normal URLs and email-like prose intact around userinfo", () => {
+    const scheme = "https" + "://";
+    expect(sanitizeDetail(`${scheme}example.com/a@b:c@d`)).toBe(`${scheme}example.com/a@b:c@d`);
+    expect(sanitizeDetail(`${scheme}example.com?u=a:b@c`)).toBe(`${scheme}example.com?u=a:b@c`);
+    expect(sanitizeDetail("mail ops@example.com or dev@example.org: thanks @team")).toBe(
+      "mail ops@example.com or dev@example.org: thanks @team",
+    );
+    expect(sanitizeDetail(`${scheme}svc:pa@ss@host and ops@example.com`)).toBe(`${scheme}[redacted]host and ops@example.com`);
+  });
+
   it("does not over-redact look-alikes", () => {
     for (const text of [
       "see https://example.com:8080/path/a@b",
