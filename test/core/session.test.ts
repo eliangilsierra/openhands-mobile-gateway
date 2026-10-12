@@ -2,7 +2,16 @@ import { readFileSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProjectRegistry } from "../../src/core/projects.js";
-import { DEFAULT_MAX_TASK_CHARS, submitTask, type SubmitTaskDeps } from "../../src/core/session.js";
+import {
+  DEFAULT_MAX_TASK_CHARS,
+  getStatus,
+  pauseTask,
+  resumeTask,
+  stopTask,
+  submitTask,
+  type SessionControlDeps,
+  type SubmitTaskDeps,
+} from "../../src/core/session.js";
 import { AuthError, ConflictError, UnavailableError } from "../../src/openhands/errors.js";
 import { createOpenHandsRestClient } from "../../src/openhands/rest.js";
 import { ChatStateRepository } from "../../src/store/chat-state.js";
@@ -301,5 +310,143 @@ describe("submitTask", () => {
     const source = readFileSync(new URL("../../src/core/session.ts", import.meta.url), "utf8");
     expect(source).not.toMatch(/child_process|node:fs|node:path|\bexec(Sync)?\(|\bspawn\(/);
     expect(source).not.toMatch(/`[^`]*\$\{text\}[^`]*`/);
+  });
+});
+
+describe("session controls", () => {
+  const CONV_PATH = `/api/conversations/${CONVERSATION_ID}`;
+  let deps: SessionControlDeps;
+  beforeEach(() => {
+    const client = createOpenHandsRestClient({ baseUrl: server.baseUrl, apiKey: "k", retry: { maxAttempts: 1 } });
+    deps = { chatState, bindings, client, logger };
+  });
+
+  function bind(): void {
+    chatState.setActiveProject("telegram", "42", "alpha");
+    bindings.create({
+      channel: "telegram",
+      externalChatId: "42",
+      projectKey: "alpha",
+      workingDir: "/projects/alpha",
+      conversationId: CONVERSATION_ID,
+    });
+  }
+  const requestLines = () => server.requests.map((r) => `${r.method} ${r.path}`);
+
+  it.each([
+    ["pauseTask", pauseTask, `POST ${CONV_PATH}/pause`],
+    ["resumeTask", resumeTask, `POST ${CONV_PATH}/run`],
+    ["stopTask", stopTask, `POST ${CONV_PATH}/interrupt`],
+  ] as const)("T-AC-1/2: %s calls exactly its upstream route and never deletes", async (_n, fn, expected) => {
+    bind();
+    expect(await fn(deps, TARGET)).toEqual({ status: "ok" });
+    expect(requestLines()).toEqual([expected]);
+    expect(bindings.findActive("telegram", "42", "alpha")?.state).toBe("active");
+  });
+
+  it.each([
+    ["idle", "idle"],
+    ["running", "running"],
+    ["paused", "paused"],
+    ["waiting_for_confirmation", "waiting_for_confirmation"],
+    ["finished", "finished"],
+    ["error", "error"],
+    ["stuck", "stuck"],
+    ["something_new", "unknown"],
+  ] as const)("T-AC-3: getStatus maps execution_status %s", async (raw, expected) => {
+    bind();
+    server.addRule({ method: "GET", path: CONV_PATH, status: 200, body: { id: CONVERSATION_ID, execution_status: raw } });
+    expect(await getStatus(deps, TARGET)).toEqual({ status: "ok", executionStatus: expected });
+    expect(requestLines()).toEqual([`GET ${CONV_PATH}`]);
+  });
+
+  it("getStatus ignores runtime status and reports unknown when execution_status is absent", async () => {
+    bind();
+    server.addRule({ method: "GET", path: CONV_PATH, status: 200, body: { id: CONVERSATION_ID, runtime_status: "running" } });
+    expect(await getStatus(deps, TARGET)).toEqual({ status: "ok", executionStatus: "unknown" });
+  });
+
+  it.each([
+    ["getStatus", getStatus],
+    ["pauseTask", pauseTask],
+    ["resumeTask", resumeTask],
+    ["stopTask", stopTask],
+  ] as const)("T-AC-4: %s without a binding makes no OpenHands call", async (_n, fn) => {
+    expect(await fn(deps, TARGET)).toEqual({ status: "no_active_binding" });
+    chatState.setActiveProject("telegram", "42", "alpha"); // project chosen, but no conversation yet
+    expect(await fn(deps, TARGET)).toEqual({ status: "no_active_binding" });
+    expect(server.requests).toHaveLength(0);
+  });
+
+  it("does not act on another chat's binding", async () => {
+    bind();
+    expect(await pauseTask(deps, { channel: "telegram", externalChatId: "43" })).toEqual({ status: "no_active_binding" });
+    expect(server.requests).toHaveLength(0);
+  });
+
+  it("maps a 404 to conversation_gone and a 409 on run to already_running", async () => {
+    bind();
+    server.addRule({ method: "POST", path: `${CONV_PATH}/pause`, status: 404, times: 1 });
+    server.addRule({ method: "POST", path: `${CONV_PATH}/run`, status: 409, times: 1 });
+    expect(await pauseTask(deps, TARGET)).toEqual({ status: "conversation_gone" });
+    expect(await resumeTask(deps, TARGET)).toEqual({ status: "already_running" });
+  });
+
+  describe("upstream errors", () => {
+    const ctx = { method: "POST", route: "/x" };
+    const cases = [
+      ["401", new AuthError({ ...ctx, status: 401 }), "auth_error"],
+      ["503", new UnavailableError({ ...ctx, status: 503 }), "unavailable"],
+      ["504", new UnavailableError({ ...ctx, status: 504 }), "outcome_unknown"],
+      ["other", new TypeError("boom"), "error"],
+    ] as const;
+
+    it.each(cases)("maps %s and never retries", async (_n, error, expected) => {
+      bind();
+      const reject = vi.fn().mockRejectedValue(error);
+      const failing: SessionControlDeps = {
+        chatState,
+        bindings,
+        logger,
+        client: {
+          getConversation: reject,
+          pauseConversation: reject,
+          runConversation: reject,
+          interruptConversation: reject,
+        },
+      };
+      expect(await pauseTask(failing, TARGET)).toEqual({ status: expected });
+      expect(await getStatus(failing, TARGET)).toEqual({ status: expected });
+      expect(reject).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("keeps the subscriber in step: terminal on finished, active again on resume", async () => {
+    bind();
+    const setTerminal = vi.fn();
+    const withHook: SessionControlDeps = { ...deps, setTerminal };
+    server.addRule({
+      method: "GET",
+      path: CONV_PATH,
+      status: 200,
+      body: { id: CONVERSATION_ID, execution_status: "finished" },
+      times: 1,
+    });
+    await getStatus(withHook, TARGET);
+    expect(setTerminal).toHaveBeenLastCalledWith(CONVERSATION_ID, true);
+    await resumeTask(withHook, TARGET);
+    expect(setTerminal).toHaveBeenLastCalledWith(CONVERSATION_ID, false);
+  });
+
+  it("a throwing setTerminal hook never fails the command", async () => {
+    bind();
+    const withHook: SessionControlDeps = {
+      ...deps,
+      setTerminal: () => {
+        throw new Error("boom");
+      },
+    };
+    expect(await resumeTask(withHook, TARGET)).toEqual({ status: "ok" });
+    expect(logger.records.some((r) => r.fields?.["event"] === "session.set_terminal_failed")).toBe(true);
   });
 });
