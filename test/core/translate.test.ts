@@ -667,6 +667,41 @@ describe("final review round (N1, N2, N4, P11, CR-10)", () => {
     expect(multi).toBe(`${scheme}[redacted]example.com/`);
   });
 
+  it("redacts long passwords and raw @ in the user part (DQ-6, DQ-7)", () => {
+    const scheme = "https" + "://";
+    const long = `${"Ab1".repeat(60)}@Zq9${"Xy2".repeat(50)}`; // 180+ chars with an '@'
+    const out6 = sanitizeDetail(`${scheme}svc:${long}@example.com/repo`, 4096);
+    expect(out6).toBe(`${scheme}[redacted]example.com/repo`);
+    const out7 = sanitizeDetail(`${scheme}us@er:Hunt3r2pw@example.com/repo`, 4096);
+    expect(out7).not.toContain("Hunt3r2pw");
+    expect(out7).toBe(`${scheme}[redacted]example.com/repo`);
+    const both = sanitizeDetail(`${scheme}a@b:${"Q7".repeat(100)}@host.example`, 4096);
+    expect(both).toBe(`${scheme}[redacted]host.example`);
+  });
+
+  it("redacts passwords holding an unencoded '/', '?' or '#'", () => {
+    const scheme = "https" + "://";
+    for (const ch of ["/", "?", "#"]) {
+      const out = sanitizeDetail(`clone ${scheme}svc:pw${ch}Zk93x${ch}Tail@example.com/repo.git now`, 4096);
+      expect(out).not.toContain("Zk93x");
+      expect(out).not.toContain("Tail");
+      expect(out).toBe(`clone ${scheme}[redacted]example.com/repo.git now`);
+    }
+    // A host:port followed by a path is not userinfo.
+    expect(sanitizeDetail(`${scheme}example.com:8080/p/a@b`)).toBe(`${scheme}example.com:8080/p/a@b`);
+    expect(sanitizeDetail(`${scheme}example.com:8080?x=a@b`)).toBe(`${scheme}example.com:8080?x=a@b`);
+  });
+
+  it("userinfo scanning stays fast on hostile input", () => {
+    const scheme = "https" + "://";
+    for (const unit of [`${scheme}a:`, `${scheme}`, "x@:/", `${scheme}a@`]) {
+      const input = unit.repeat(Math.ceil(70_000 / unit.length));
+      const start = performance.now();
+      sanitizeDetail(input, 4096);
+      expect(performance.now() - start).toBeLessThan(1500);
+    }
+  });
+
   it("keeps normal URLs and email-like prose intact around userinfo", () => {
     const scheme = "https" + "://";
     expect(sanitizeDetail(`${scheme}example.com/a@b:c@d`)).toBe(`${scheme}example.com/a@b:c@d`);

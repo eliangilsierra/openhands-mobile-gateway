@@ -108,8 +108,6 @@ const SECRET_PATTERNS: readonly RegExp[] = [
   // Quoted values may contain spaces: redact up to the closing quote (must precede the generic forms).
   new RegExp(`${KEYWORD}${NAME_TAIL}["']?[ \\t]*[=:][ \\t]*"${NOT_YET_REDACTED}[^"]{4,256}"`, "g"),
   new RegExp(`${KEYWORD}${NAME_TAIL}["']?[ \\t]*[=:][ \\t]*'${NOT_YET_REDACTED}[^']{4,256}'`, "g"),
-  // URL userinfo (scheme://user:pw@host): only the credentials are replaced.
-  /(?<=[A-Za-z][A-Za-z0-9+.-]{1,15}:\/\/)[^\s:/?#@"']{1,64}:[^\s/?#"']{1,128}@/g,
   // curl -u user:pw / --user user:pw.
   /\bcurl\b[^\n|;&]{0,200}?[ \t](?:-u|--user)[ \t]+[^\s:]{1,64}:\S{1,128}/g,
   // Cookie / Set-Cookie header values (name=value pairs) and session ids that contain a digit.
@@ -147,8 +145,74 @@ function cutUnits(text: string, max: number): string {
   return text.slice(0, code >= 0xd800 && code <= 0xdbff ? max - 1 : max);
 }
 
+const SCHEME_START = /[A-Za-z][A-Za-z0-9+.-]{1,15}:\/\//g;
+/** Longest authority-plus-path window examined after a `scheme://` (bounds the cost per scheme). */
+const USERINFO_WINDOW = 2048;
+
+/**
+ * Finds `user:password@` (the '@' included) after each `scheme://`, as [from, to) ranges.
+ * A small scanner instead of a regex: no backtracking, at most USERINFO_WINDOW units per scheme.
+ * The token ends at whitespace or a quote. Usually the userinfo ends at the last '@' before the
+ * first '/', '?' or '#'. If there is none, the password itself holds an unencoded '/', '?' or '#'
+ * and the last '@' of the token is used, unless the text after the first ':' up to that delimiter
+ * is a port (digits), as in `host:8080/path/a@b`, or the user part already contains a delimiter
+ * (`host?u=a:b@c`, `host/a@b:c@d`). By-spec residual: a password made only of digits followed by
+ * '/', '?' or '#' is read as a port, and a password holding both an '@' and a later delimiter is
+ * cut at the last '@' before that delimiter; an over-redaction in a path/query '@' is accepted.
+ */
+function userinfoRanges(text: string): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
+  SCHEME_START.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = SCHEME_START.exec(text)) !== null) {
+    const start = m.index + m[0].length;
+    let end = Math.min(text.length, start + USERINFO_WINDOW);
+    for (let i = start; i < end; i += 1) {
+      const c = text.charCodeAt(i);
+      if (c === 0x20 || (c >= 0x09 && c <= 0x0d) || c === 0x22 || c === 0x27 || c === 0xa0) {
+        end = i;
+        break;
+      }
+    }
+    let delim = end;
+    for (let i = start; i < end; i += 1) {
+      const c = text[i];
+      if (c === "/" || c === "?" || c === "#") {
+        delim = i;
+        break;
+      }
+    }
+    let at = text.lastIndexOf("@", delim - 1);
+    if (at < start) {
+      at = delim < end ? text.lastIndexOf("@", end - 1) : -1;
+      if (at < start) continue;
+      const colon = text.indexOf(":", start);
+      if (colon < 0 || colon >= delim) continue;
+      if (/^\d*$/.test(text.slice(colon + 1, delim))) continue; // host:port/path...@...
+    } else {
+      const colon = text.indexOf(":", start);
+      if (colon < 0 || colon >= at) continue;
+    }
+    if (!/^[A-Za-z0-9[]/.test(text.slice(at + 1, at + 2))) continue; // a host must follow
+    ranges.push([start, at + 1]);
+    SCHEME_START.lastIndex = at + 1;
+  }
+  return ranges;
+}
+
 function redact(text: string): string {
   let out = text;
+  const found = userinfoRanges(out);
+  if (found.length > 0) {
+    const parts: string[] = [];
+    let cursor = 0;
+    for (const [from, to] of found) {
+      parts.push(out.slice(cursor, from), REDACTED);
+      cursor = to;
+    }
+    parts.push(out.slice(cursor));
+    out = parts.join("");
+  }
   for (const pattern of SECRET_PATTERNS) out = out.replace(pattern, REDACTED);
   return out;
 }
@@ -174,17 +238,19 @@ function redactSplitSecrets(value: string): string {
   }
   const text = kept.join("");
   const ranges: Array<[number, number]> = [];
+  const found: Array<[number, number]> = userinfoRanges(text).map(([a, b]) => [a, b]);
   for (const pattern of SECRET_PATTERNS) {
-    for (const m of text.matchAll(pattern)) {
-      if (m[0].length === 0) continue;
-      const from = origin[m.index];
-      const last = origin[m.index + m[0].length - 1];
-      if (from === undefined || last === undefined) continue;
-      const to = last + 1;
-      // Identical in the original: the ordinary pass after cleaning redacts it.
-      if (value.slice(from, to) === m[0]) continue;
-      ranges.push([from, to]);
-    }
+    for (const m of text.matchAll(pattern)) found.push([m.index, m.index + m[0].length]);
+  }
+  for (const [a, b] of found) {
+    if (b <= a) continue;
+    const from = origin[a];
+    const last = origin[b - 1];
+    if (from === undefined || last === undefined) continue;
+    const to = last + 1;
+    // Identical in the original: the ordinary pass after cleaning redacts it.
+    if (value.slice(from, to) === text.slice(a, b)) continue;
+    ranges.push([from, to]);
   }
   if (ranges.length === 0) return value;
   ranges.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
