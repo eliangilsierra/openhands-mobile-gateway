@@ -760,3 +760,54 @@ describe("final review round (N1, N2, N4, P11, CR-10)", () => {
     expect(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(out)).toBe(false);
   });
 });
+
+describe("final fix round (N5, N6)", () => {
+  const scheme = "https" + "://";
+  const gone = (input: string, secret: string): void => {
+    const out = sanitizeDetail(input, 4096);
+    expect(out).toContain("[redacted]");
+    expect(out).not.toContain(secret);
+  };
+
+  it("redacts URL userinfo behind an invisible character after :// or inside the scheme", () => {
+    for (const ch of ["\u200b", "\u2060", "\u00ad", "\u0301", "\ufeff"]) {
+      gone(`clone ${scheme}${ch}deploy:hunter2pw@example.com/repo.git`, "hunter2pw");
+      gone(`clone ht${ch}tps://deploy:hunter2pw@example.com/repo.git`, "hunter2pw");
+      gone(`clone https:${ch}//deploy:hunter2pw@example.com/repo.git`, "hunter2pw");
+    }
+    gone(`clone ${scheme}\u200b\u200bsvc:pa@ssw0rd@example.com/x`, "ssw0rd");
+  });
+
+  it("redacts curl -uuser:pw, -su user:pw, --user=user:pw and --user user:pw", () => {
+    gone("curl -uadmin:hunter2pw https://example.com/api", "hunter2pw");
+    gone("curl -su admin:hunter2pw https://example.com/api", "hunter2pw");
+    gone("curl -sSuadmin:hunter2pw https://example.com/api", "hunter2pw");
+    gone("curl --user=admin:hunter2pw https://example.com/api", "hunter2pw");
+    gone("curl --user admin:hunter2pw https://example.com/api", "hunter2pw");
+  });
+
+  it("does not over-redact near the new rules", () => {
+    for (const text of [
+      "curl -s http://localhost:3000/ui",
+      "curl -sS https://example.com:8443/health",
+      "curl --url https://example.com:8443/x",
+      "curl -u admin https://example.com",
+      "curl --user admin https://example.com",
+      "curl --max-time 5 -H x:y https://example.com",
+      "see https://example.com/path and ht tps docs",
+      `${scheme}example.com:8080/path/a@b`,
+    ]) {
+      expect(sanitizeDetail(text)).toBe(text);
+    }
+    expect(sanitizeDetail(`open ${scheme}\u200bexample.com/docs ok`)).toBe(`open ${scheme} example.com/docs ok`);
+  });
+
+  it("stays linear with many hidden characters around schemes", () => {
+    const unit = `${scheme}\u200bu:p@h `;
+    for (const n of [100_000, 500_000]) {
+      const start = performance.now();
+      sanitizeDetail(unit.repeat(Math.ceil(n / unit.length)), 4096);
+      expect(performance.now() - start).toBeLessThan(1500);
+    }
+  });
+});

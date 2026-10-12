@@ -108,8 +108,8 @@ const SECRET_PATTERNS: readonly RegExp[] = [
   // Quoted values may contain spaces: redact up to the closing quote (must precede the generic forms).
   new RegExp(`${KEYWORD}${NAME_TAIL}["']?[ \\t]*[=:][ \\t]*"${NOT_YET_REDACTED}[^"]{4,256}"`, "g"),
   new RegExp(`${KEYWORD}${NAME_TAIL}["']?[ \\t]*[=:][ \\t]*'${NOT_YET_REDACTED}[^']{4,256}'`, "g"),
-  // curl -u user:pw / --user user:pw.
-  /\bcurl\b[^\n|;&]{0,200}?[ \t](?:-u|--user)[ \t]+[^\s:]{1,64}:\S{1,128}/g,
+  // curl -u user:pw, -uuser:pw, -su user:pw, --user user:pw, --user=user:pw.
+  /\bcurl\b[^\n|;&]{0,200}?[ \t](?:-[A-Za-z]{0,8}u[ \t]*|--user(?:=|[ \t]+))[^\s:]{1,64}:\S{1,128}/g,
   // Cookie / Set-Cookie header values (name=value pairs) and session ids that contain a digit.
   new RegExp(`${ci("cookie")}[ \\t]*:[ \\t]*${NOT_YET_REDACTED}(?:[A-Za-z0-9_.-]{1,64}=[^\\s;"']{1,512}(?:;[ \\t]*)?){1,16}`, "g"),
   new RegExp(
@@ -148,6 +148,8 @@ function cutUnits(text: string, max: number): string {
 const SCHEME_START = /[A-Za-z][A-Za-z0-9+.-]{1,15}:\/\//g;
 /** Longest authority-plus-path window examined after a `scheme://` (bounds the cost per scheme). */
 const USERINFO_WINDOW = 2048;
+/** Longest `scheme://` (16 + 3) examined behind a userinfo range for hidden characters. */
+const SCHEME_LOOKBACK = 19;
 
 /**
  * Finds `user:password@` (the '@' included) after each `scheme://`, as [from, to) ranges.
@@ -256,7 +258,16 @@ function redactSplitSecrets(value: string): string {
   }
   const text = kept.join("");
   const ranges: Array<[number, number]> = [];
-  const found: Array<[number, number]> = userinfoRanges(text).map(([a, b]) => [a, b]);
+  // A userinfo range also owns the hidden characters right before it and the scheme in front of
+  // it (`https://<ZWSP>user:pw@`, `ht<ZWSP>tps://user:pw@`): the ordinary pass cannot see those.
+  const found: Array<[number, number]> = [];
+  for (const [a, b] of userinfoRanges(text)) {
+    const back = Math.max(0, a - SCHEME_LOOKBACK);
+    const hidden = value.slice(origin[back] ?? 0, origin[a] ?? 0) !== text.slice(back, a);
+    const prev = origin[a - 1];
+    const last = origin[b - 1];
+    if (hidden && prev !== undefined && last !== undefined) ranges.push([prev + 1, last + 1]);
+  }
   for (const pattern of SECRET_PATTERNS) {
     for (const m of text.matchAll(pattern)) found.push([m.index, m.index + m[0].length]);
   }
