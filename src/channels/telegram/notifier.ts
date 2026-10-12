@@ -325,7 +325,15 @@ export class Notifier {
     if (evictedAny) {
       this.logger?.warn("notifier queue full, dropped oldest notification", { event: "notify.dropped", status: "queue_full" });
     }
-    chat.jobs.push(job);
+    // The group may already have lost a chunk (its note is queued or sent), possibly just now to make
+    // room for this one: no partial delivery after the note.
+    if (!this.isOfNotedGroup(job)) {
+      chat.jobs.push(job);
+    }
+  }
+
+  private isOfNotedGroup(job: Job): boolean {
+    return job.kind === "text" && job.group?.noted === true;
   }
 
   private failureNote(group: ChunkGroup): Job {

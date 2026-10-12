@@ -345,6 +345,22 @@ describe("errors (T-AC-5)", () => {
     expect(logs.records.some((r) => r.fields?.["event"] === "notify.rate_limited")).toBe(true);
   });
 
+  it("does not delay another chat while one chat waits out a 429", async () => {
+    const { notifier, calls } = setup((call) =>
+      call.payload["chat_id"] === CHAT
+        ? { ok: false, error_code: 429, description: "Too Many Requests: retry after 60", parameters: { retry_after: 60 } }
+        : ok(),
+    );
+    notifier.enqueue({ ...out("other chat 1", { terminal: true }), chatId: OTHER_CHAT });
+    notifier.enqueue(out("blocked chat", { terminal: true }));
+    await vi.advanceTimersByTimeAsync(0); // chat 42 is rate limited for 60 s; chat 43 is tracked
+    notifier.enqueue({ ...out("other chat 2", { terminal: true }), chatId: OTHER_CHAT });
+    await vi.advanceTimersByTimeAsync(2000);
+    const other = sends(calls).filter((c) => c.payload["chat_id"] === OTHER_CHAT);
+    expect(other.map((c) => c.payload["text"])).toEqual(["other chat 1", "other chat 2"]);
+    expect(sends(calls).filter((c) => c.payload["chat_id"] === CHAT)).toHaveLength(1);
+  });
+
   it("drops the whole queue of a chat that blocked the bot (403) and keeps other chats", async () => {
     const { notifier, calls, logs } = setup((call) =>
       call.payload["chat_id"] === CHAT ? { ok: false, error_code: 403, description: "Forbidden: bot was blocked by the user" } : ok(),
@@ -520,6 +536,82 @@ describe("queue overflow with chunked bodies (QA cycle 2: F-1, F-2)", () => {
 
     const texts = sends(calls).map((c) => String(c.payload["text"]));
     expect(chunkTags(texts)).toEqual(["(1/3)", "(1/3)", "(1/3)"]);
+    expect(texts.filter((t) => t === CHUNK_FAILURE_NOTE)).toHaveLength(1);
+  });
+
+  it("sends none of the later chunks of a group whose note was already queued", async () => {
+    let releaseFirst: (() => void) | undefined;
+    const { notifier, calls } = setup(async (_call, n): Promise<ApiResult> => {
+      if (n === 0) {
+        await new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+      }
+      return ok();
+    });
+    notifier.enqueue(out("z".repeat(11_000), { terminal: true })); // (1/3) in flight
+    await vi.advanceTimersByTimeAsync(0);
+    for (let i = 0; i < MAX_QUEUED_JOBS + 100; i++) {
+      notifier.enqueue(out("y".repeat(11_000), { terminal: true })); // each loses chunks to overflow
+      expect(notifier.pending(CHAT)).toBeLessThanOrEqual(MAX_QUEUED_JOBS);
+    }
+    releaseFirst?.();
+    await vi.advanceTimersByTimeAsync(3_600_000);
+
+    const texts = sends(calls).map((c) => String(c.payload["text"]));
+    const firstNote = texts.indexOf(CHUNK_FAILURE_NOTE);
+    expect(firstNote).toBeGreaterThan(0);
+    // After a group's note, none of that group's chunks may follow: every chunk sent is chunk 1 of
+    // the in-flight group, or belongs to a group that was delivered whole (none here).
+    expect(chunkTags(texts)).toEqual(["(1/3)"]);
+    expect(notifier.pending(CHAT)).toBe(0);
+  });
+
+  it("keeps the cap when the evicted job is the last queued chunk of a group", async () => {
+    let releaseFirst: (() => void) | undefined;
+    const { notifier } = setup(async (_call, n): Promise<ApiResult> => {
+      if (n === 0) {
+        await new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+      }
+      return ok();
+    });
+    notifier.enqueue(out("z".repeat(5000), { terminal: true })); // (1/2) in flight, (2/2) queued
+    await vi.advanceTimersByTimeAsync(0);
+    for (let i = 0; i < MAX_QUEUED_JOBS + 5; i++) {
+      notifier.enqueue(out(`f${String(i)}`, { terminal: true }));
+      expect(notifier.pending(CHAT)).toBeLessThanOrEqual(MAX_QUEUED_JOBS);
+    }
+    releaseFirst?.();
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(notifier.pending(CHAT)).toBe(0);
+  });
+
+  it("evicts a queued chunk of an already noted group without a second note", async () => {
+    let releaseFirst: (() => void) | undefined;
+    const { notifier, calls } = setup(async (_call, n): Promise<ApiResult> => {
+      if (n === 0) {
+        await new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+        return { ok: false, error_code: 500, description: "Internal Server Error" };
+      }
+      return ok();
+    });
+    notifier.enqueue(out("z".repeat(11_000), { terminal: true }));
+    await vi.advanceTimersByTimeAsync(0); // (1/3) in flight
+    for (let i = 0; i < MAX_QUEUED_JOBS; i++) {
+      notifier.enqueue(out(`f${String(i)}`, { terminal: true })); // overflow: note queued
+    }
+    releaseFirst?.();
+    await vi.advanceTimersByTimeAsync(0); // (1/3) failed once and waits for its retry, not in flight
+    notifier.enqueue(out("late", { terminal: true })); // evicts that waiting chunk of the noted group
+    expect(notifier.pending(CHAT)).toBeLessThanOrEqual(MAX_QUEUED_JOBS);
+    await vi.advanceTimersByTimeAsync(600_000);
+
+    const texts = sends(calls).map((c) => String(c.payload["text"]));
+    expect(chunkTags(texts)).toEqual(["(1/3)"]);
     expect(texts.filter((t) => t === CHUNK_FAILURE_NOTE)).toHaveLength(1);
   });
 
