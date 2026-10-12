@@ -174,6 +174,94 @@ describe("ConversationBindingRepository", () => {
   });
 });
 
+describe("retention (issue #27)", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const base = new Date("2026-01-31T00:00:00.000Z");
+  const bind = (id: string, chat: string, state: string, daysAgo: number) =>
+    db
+      .prepare(
+        "INSERT INTO conversation_binding (channel, external_chat_id, project_key, working_dir, conversation_id, state, created_at, last_used_at) VALUES (?,?,?,?,?,?,?,?)",
+      )
+      .run(
+        "telegram",
+        chat,
+        "alpha",
+        "/p",
+        id,
+        state,
+        "t",
+        new Date(base.getTime() - daysAgo * DAY).toISOString(),
+      );
+
+  it("AC-1: prunes old closed/stale bindings, keeps recent ones and every active one", () => {
+    const repo = new ConversationBindingRepository(db, logger, () => base);
+    bind("old-closed", "1", "closed", 40);
+    bind("old-stale", "2", "stale", 40);
+    bind("new-closed", "3", "closed", 5);
+    bind("old-active", "4", "active", 400);
+
+    expect(repo.pruneInactive(30 * DAY)).toBe(2);
+    expect(repo.findByConversationId("old-closed")).toBeNull();
+    expect(repo.findByConversationId("old-stale")).toBeNull();
+    expect(repo.findByConversationId("new-closed")?.state).toBe("closed");
+    expect(repo.findByConversationId("old-active")?.state).toBe("active");
+    expect(repo.pruneInactive(30 * DAY)).toBe(0);
+  });
+
+  it("keeps an old binding that still has an unresolved pending confirmation", () => {
+    const repo = new ConversationBindingRepository(db, logger, () => base);
+    bind("pending-conv", "1", "closed", 40);
+    bind("resolved-conv", "2", "closed", 40);
+    const pending = new PendingConfirmationRepository(db, logger);
+    pending.create({
+      conversationId: "pending-conv",
+      actionEventId: "a1",
+      channel: "telegram",
+      externalChatId: "1",
+      channelMessageId: "m1",
+    });
+    const resolved = pending.create({
+      conversationId: "resolved-conv",
+      actionEventId: "a2",
+      channel: "telegram",
+      externalChatId: "2",
+      channelMessageId: "m2",
+    });
+    db.prepare("UPDATE pending_confirmation SET resolved_at = ? WHERE id = ?").run("t", resolved.id);
+
+    expect(repo.pruneInactive(30 * DAY)).toBe(1);
+    expect(repo.findByConversationId("pending-conv")).not.toBeNull();
+    expect(repo.findByConversationId("resolved-conv")).toBeNull();
+  });
+
+  it("does not touch seen_event or event_cursor", () => {
+    const repo = new ConversationBindingRepository(db, logger, () => base);
+    bind("c1", "1", "closed", 40);
+    db.prepare("INSERT INTO seen_event (conversation_id, event_id, seen_at) VALUES (?,?,?)").run("c1", "e1", "t");
+    repo.pruneInactive(0);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM seen_event").get()?.["n"]).toBe(1);
+  });
+
+  it("rejects an invalid age", () => {
+    const repo = new ConversationBindingRepository(db, logger);
+    expect(() => repo.pruneInactive(-1)).toThrow(RangeError);
+    expect(() => repo.pruneInactive(Number.NaN)).toThrow(RangeError);
+  });
+
+  it("AC-2: deletes one chat's state only, and treats metacharacters as data", () => {
+    const repo = new ChatStateRepository(db, logger);
+    repo.setActiveProject("telegram", "1", "alpha");
+    repo.setActiveProject("telegram", "2", "beta");
+    repo.setActiveProject("telegram", NASTY, "gamma");
+    expect(repo.delete("telegram", "1")).toBe(true);
+    expect(repo.delete("telegram", "1")).toBe(false);
+    expect(repo.find("telegram", "1")).toBeNull();
+    expect(repo.getActiveProject("telegram", "2")).toBe("beta");
+    expect(repo.delete("telegram", NASTY)).toBe(true);
+    expect(tableNames(db)).toContain("chat_state");
+  });
+});
+
 describe("EventCursorRepository", () => {
   it("reads null, then advances and overwrites", () => {
     const repo = new EventCursorRepository(db, logger);
