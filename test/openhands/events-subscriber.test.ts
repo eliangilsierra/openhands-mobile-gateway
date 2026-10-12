@@ -97,10 +97,15 @@ async function startServer(): Promise<MockServer> {
     }
     res.writeHead(404).end();
   });
-  server.on("upgrade", (req: IncomingMessage, socket: Socket) => {
+  // Track every raw socket from accept time: a connection whose handshake never completes
+  // (hangWs, aborted client) or an idle keep-alive one would otherwise hold server.close() open.
+  server.on("connection", (socket: Socket) => {
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
     socket.on("error", () => undefined);
+  });
+  server.on("upgrade", (req: IncomingMessage, socket: Socket) => {
+    sockets.add(socket);
     if (state.refuseWs) {
       socket.destroy();
       return;
@@ -168,8 +173,18 @@ async function startServer(): Promise<MockServer> {
   return Object.assign(state, {
     baseUrl: `http://127.0.0.1:${port}`,
     stop: async () => {
+      server.closeAllConnections();
       for (const s of sockets) s.destroy();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      // Bounded wait: teardown must never hang the hook, whatever the sockets are doing.
+      let timer: NodeJS.Timeout | undefined;
+      const bound = new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, 2_000);
+      });
+      try {
+        await Promise.race([new Promise<void>((resolve) => server.close(() => resolve())), bound]);
+      } finally {
+        clearTimeout(timer);
+      }
     },
   });
 }
