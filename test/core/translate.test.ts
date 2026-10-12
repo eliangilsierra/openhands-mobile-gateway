@@ -692,14 +692,41 @@ describe("final review round (N1, N2, N4, P11, CR-10)", () => {
     expect(sanitizeDetail(`${scheme}example.com:8080?x=a@b`)).toBe(`${scheme}example.com:8080?x=a@b`);
   });
 
-  it("userinfo scanning stays fast on hostile input", () => {
+  it("userinfo scanning stays fast and scales linearly on hostile input", () => {
     const scheme = "https" + "://";
-    for (const unit of [`${scheme}a:`, `${scheme}`, "x@:/", `${scheme}a@`]) {
+    const run = (unit: string, maxLength: number): number => {
       const input = unit.repeat(Math.ceil(70_000 / unit.length));
-      const start = performance.now();
-      sanitizeDetail(input, 4096);
-      expect(performance.now() - start).toBeLessThan(1500);
+      let best = Number.POSITIVE_INFINITY;
+      for (let k = 0; k < 3; k += 1) {
+        const start = performance.now();
+        sanitizeDetail(input, maxLength);
+        best = Math.min(best, performance.now() - start);
+      }
+      return best;
+    };
+    // The input is cut at 16 x maxLength, so 4096 vs 256 is a 16x larger scan: linear grows ~16x,
+    // a quadratic scan ~256x. The limit (64x, over a 5 ms floor) leaves room for timer noise.
+    for (const unit of [`${scheme}a:`, scheme, "a://@", "x@:/", `${scheme}a@`, `${scheme}a:b/${scheme}`]) {
+      const small = run(unit, 256);
+      const large = run(unit, 4096);
+      expect(large).toBeLessThan(Math.max(small, 5) * 64);
+      expect(large).toBeLessThan(1500);
     }
+  });
+
+  it("requires a host after the '@' (a trailing or punctuation-only '@' is not userinfo)", () => {
+    const scheme = "https" + "://";
+    for (const text of [`${scheme}svc:pw@`, `${scheme}svc:pw@ rest`, `${scheme}svc:pw@.x`, `${scheme}svc:pw@-x`, `${scheme}svc:pw@/x`]) {
+      expect(sanitizeDetail(text)).toBe(text);
+    }
+    expect(sanitizeDetail(`${scheme}svc:pw@host`)).toBe(`${scheme}[redacted]host`);
+  });
+
+  it("ends the userinfo token at a quote, so userinfo-like text after a quote is not eaten", () => {
+    const scheme = "https" + "://";
+    expect(sanitizeDetail(`${scheme}example.com"x:y@host`)).toBe(`${scheme}example.com"x:y@host`);
+    expect(sanitizeDetail(`${scheme}example.com'x:y@host`)).toBe(`${scheme}example.com'x:y@host`);
+    expect(sanitizeDetail(`"${scheme}svc:Kq8@host"`)).toBe(`"${scheme}[redacted]host"`);
   });
 
   it("keeps normal URLs and email-like prose intact around userinfo", () => {

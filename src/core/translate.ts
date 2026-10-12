@@ -162,42 +162,60 @@ const USERINFO_WINDOW = 2048;
  */
 function userinfoRanges(text: string): Array<[number, number]> {
   const ranges: Array<[number, number]> = [];
+  // Every lookup below is monotone in `start` (which only grows), so each one keeps its last
+  // result and only scans text it has not scanned before: the total work is O(n), however many
+  // `scheme://` occurrences there are.
+  const nextStop = nextFinder(text, (c) => c === 0x20 || (c >= 0x09 && c <= 0x0d) || c === 0x22 || c === 0x27 || c === 0xa0);
+  const nextDelim = nextFinder(text, (c) => c === 0x2f || c === 0x3f || c === 0x23); // '/', '?', '#'
+  const nextColon = nextFinder(text, (c) => c === 0x3a);
+  const atBeforeDelim = lastAtFinder(text);
+  const atBeforeEnd = lastAtFinder(text);
   SCHEME_START.lastIndex = 0;
   let m: RegExpExecArray | null;
   while ((m = SCHEME_START.exec(text)) !== null) {
     const start = m.index + m[0].length;
-    let end = Math.min(text.length, start + USERINFO_WINDOW);
-    for (let i = start; i < end; i += 1) {
-      const c = text.charCodeAt(i);
-      if (c === 0x20 || (c >= 0x09 && c <= 0x0d) || c === 0x22 || c === 0x27 || c === 0xa0) {
-        end = i;
-        break;
-      }
-    }
-    let delim = end;
-    for (let i = start; i < end; i += 1) {
-      const c = text[i];
-      if (c === "/" || c === "?" || c === "#") {
-        delim = i;
-        break;
-      }
-    }
-    let at = text.lastIndexOf("@", delim - 1);
+    const end = Math.min(text.length, start + USERINFO_WINDOW, nextStop(start));
+    const delim = Math.min(end, nextDelim(start));
+    let at = atBeforeDelim(delim);
     if (at < start) {
-      at = delim < end ? text.lastIndexOf("@", end - 1) : -1;
+      at = delim < end ? atBeforeEnd(end) : -1;
       if (at < start) continue;
-      const colon = text.indexOf(":", start);
-      if (colon < 0 || colon >= delim) continue;
+      const colon = nextColon(start);
+      if (colon >= delim) continue;
+      // The regions [start, delim) of successive schemes are disjoint, so this slice is linear overall.
       if (/^\d*$/.test(text.slice(colon + 1, delim))) continue; // host:port/path...@...
     } else {
-      const colon = text.indexOf(":", start);
-      if (colon < 0 || colon >= at) continue;
+      const colon = nextColon(start);
+      if (colon >= at) continue;
     }
     if (!/^[A-Za-z0-9[]/.test(text.slice(at + 1, at + 2))) continue; // a host must follow
     ranges.push([start, at + 1]);
     SCHEME_START.lastIndex = at + 1;
   }
   return ranges;
+}
+
+/** First index >= `from` whose code unit satisfies `test` (text.length if none); `from` never decreases. */
+function nextFinder(text: string, test: (code: number) => boolean): (from: number) => number {
+  let found = -1;
+  return (from) => {
+    if (found >= from) return found;
+    let i = from;
+    while (i < text.length && !test(text.charCodeAt(i))) i += 1;
+    found = i;
+    return i;
+  };
+}
+
+/** Index of the last '@' strictly before `limit` (-1 if none); `limit` never decreases between calls. */
+function lastAtFinder(text: string): (limit: number) => number {
+  const positions: number[] = [];
+  for (let i = text.indexOf("@"); i >= 0; i = text.indexOf("@", i + 1)) positions.push(i);
+  let next = 0; // positions[0..next) are < the last limit
+  return (limit) => {
+    while (next < positions.length && (positions[next] as number) < limit) next += 1;
+    return next === 0 ? -1 : (positions[next - 1] as number);
+  };
 }
 
 function redact(text: string): string {
