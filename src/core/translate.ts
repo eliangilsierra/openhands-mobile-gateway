@@ -128,7 +128,7 @@ const SECRET_PATTERNS: readonly RegExp[] = [
 // Characters that carry no visible content and are used to hide secrets. They are removed to
 // DETECT a secret; in the output the "formatting" and control ones become a space.
 // Marks, tag characters and Hangul/halfwidth fillers: dropped from the output.
-const STRIP_CHARS = /[\p{Mn}\u{e0000}-\u{e007f}\u115f\u1160\u3164\uffa0]/gu;
+const STRIP_CHARS = /[\p{Mn}\u{e0000}-\u{e007f}\u115f\u1160\u3164\uffa0\u2800]/gu;
 // Format characters (zero-width, bidi marks/overrides/isolates, BOM, soft hyphen, ...): a space.
 const INVISIBLE_CHARS = /\p{Cf}/gu;
 // C0/C1 controls, DEL and line/paragraph separators: a space.
@@ -148,8 +148,6 @@ function cutUnits(text: string, max: number): string {
 const SCHEME_START = /[A-Za-z][A-Za-z0-9+.-]{1,15}:\/\//g;
 /** Longest authority-plus-path window examined after a `scheme://` (bounds the cost per scheme). */
 const USERINFO_WINDOW = 2048;
-/** Longest `scheme://` (16 + 3) examined behind a userinfo range for hidden characters. */
-const SCHEME_LOOKBACK = 19;
 
 /**
  * Finds `user:password@` (the '@' included) after each `scheme://`, as [from, to) ranges.
@@ -258,15 +256,15 @@ function redactSplitSecrets(value: string): string {
   }
   const text = kept.join("");
   const ranges: Array<[number, number]> = [];
-  // A userinfo range also owns the hidden characters right before it and the scheme in front of
-  // it (`https://<ZWSP>user:pw@`, `ht<ZWSP>tps://user:pw@`): the ordinary pass cannot see those.
+  // Every userinfo range of the cleaned text is mapped back whole (hidden characters inside the
+  // user, before the colon, in the password or before the '@' included), and it also owns the
+  // hidden characters right after `://` (`https://<ZWSP>user:pw@`). A scheme split by hidden
+  // characters (`ht<ZWSP>tps://`) is found in the cleaned text, so it needs no special case.
   const found: Array<[number, number]> = [];
   for (const [a, b] of userinfoRanges(text)) {
-    const back = Math.max(0, a - SCHEME_LOOKBACK);
-    const hidden = value.slice(origin[back] ?? 0, origin[a] ?? 0) !== text.slice(back, a);
     const prev = origin[a - 1];
     const last = origin[b - 1];
-    if (hidden && prev !== undefined && last !== undefined) ranges.push([prev + 1, last + 1]);
+    if (prev !== undefined && last !== undefined) ranges.push([prev + 1, last + 1]);
   }
   for (const pattern of SECRET_PATTERNS) {
     for (const m of text.matchAll(pattern)) found.push([m.index, m.index + m[0].length]);

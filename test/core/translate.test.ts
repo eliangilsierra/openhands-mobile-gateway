@@ -811,3 +811,48 @@ describe("final fix round (N5, N6)", () => {
     }
   });
 });
+
+describe("userinfo with invisible characters (R-1)", () => {
+  const scheme = "https" + "://";
+  const hidden = ["\u200b", "\u200c", "\u200d", "\u2060", "\u00ad", "\ufeff", "\u200e", "\u202e", "\u2066", "\u180e", "\u{e0041}"];
+  const gone = (input: string): void => {
+    const out = sanitizeDetail(input, 4096);
+    expect(out).toContain("[redacted]");
+    expect(out).not.toContain("Zq7pwX");
+  };
+
+  it("redacts when the character sits before the @", () => {
+    for (const ch of hidden) gone(`clone ${scheme}deploy:Zq7pwX${ch}@example.com/r.git`);
+  });
+  it("redacts when the character sits inside the user", () => {
+    for (const ch of hidden) gone(`clone ${scheme}dep${ch}loy:Zq7pwX@example.com/r.git`);
+  });
+  it("redacts when the character sits between user and colon", () => {
+    for (const ch of hidden) gone(`clone ${scheme}deploy${ch}:Zq7pwX@example.com/r.git`);
+  });
+  it("redacts when the character sits after the colon or inside the password", () => {
+    for (const ch of hidden) {
+      gone(`clone ${scheme}deploy:${ch}Zq7pwX@example.com/r.git`);
+      gone(`clone ${scheme}deploy:Zq7${ch}pwX@example.com/r.git`);
+    }
+  });
+  it("redacts when the character sits in the scheme or after ://", () => {
+    for (const ch of hidden) {
+      gone(`clone ht${ch}tps://deploy:Zq7pwX@example.com/r.git`);
+      gone(`clone ${scheme}${ch}deploy:Zq7pwX@example.com/r.git`);
+    }
+  });
+  it("redacts with several positions combined and a braille blank", () => {
+    gone(`clone ${scheme}\u200bde\u200cploy\u200d:Zq7\u2060pwX\u200b@example.com/r.git`);
+    gone("clone https\u2800://deploy:Zq7pwX@example.com/r.git");
+  });
+  it("keeps plain URLs and stays linear on hidden-heavy input", () => {
+    expect(sanitizeDetail(`open ${scheme}example.com/a\u200bb ok`)).toBe(`open ${scheme}example.com/a b ok`);
+    const unit = `${scheme}d\u200be:p\u200b@h `;
+    for (const n of [100_000, 500_000]) {
+      const start = performance.now();
+      sanitizeDetail(unit.repeat(Math.ceil(n / unit.length)), 4096);
+      expect(performance.now() - start).toBeLessThan(1500);
+    }
+  });
+});
