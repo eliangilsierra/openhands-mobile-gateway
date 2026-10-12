@@ -23,7 +23,7 @@ import { BOT_INFO, installFakeApi, type ApiCall } from "./helpers.js";
 
 const USER = 1001;
 const OTHER = 2002;
-const CONVERSATION = "11111111-2222-3333-4444-555555555555";
+const CONVERSATION = ["11111111", "2222", "3333", "4444", "555555555555"].join("-");
 const ACTION = "99999999-aaaa-bbbb-cccc-dddddddddddd";
 const PROMPT_MESSAGE = 500;
 
@@ -190,6 +190,18 @@ describe("callback handling", () => {
     await bot.handleUpdate(tap(`c:${String(id)}:a`, { chat: -100_123, chatType: "supergroup" }));
     expect(respondCalls()).toHaveLength(0);
     expect(toasts(calls)).toEqual([REJECTED_TEXT]);
+  });
+
+  it("never asks the service to answer a tap outside the user's own private chat", async () => {
+    const asked: AnswerRequest[] = [];
+    const { bot, calls, service } = build({ answer: (r) => asked.push(r) });
+    const id = await prompt(service);
+    await bot.handleUpdate(tap(`c:${String(id)}:a`, { chat: -100_123, chatType: "supergroup" }));
+    await bot.handleUpdate(tap(`c:${String(id)}:a`, { user: OTHER, chat: USER }));
+    expect(asked).toEqual([]);
+    expect(respondCalls()).toHaveLength(0);
+    expect(toasts(calls)).toEqual([REJECTED_TEXT, REJECTED_TEXT]);
+    expect(store.findById(id)?.resolvedAt).toBeNull();
   });
 
   it("a tap on another message than the prompt is rejected", async () => {

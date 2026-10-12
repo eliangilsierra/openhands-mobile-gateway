@@ -16,7 +16,7 @@ import { PendingConfirmationRepository } from "../../src/store/pending-confirmat
 import { startMockOpenHandsServer, type MockOpenHandsServer } from "../mocks/openhands-server.js";
 import { createRecordingLogger, createTempDbPath, type RecordingLogger } from "../store/helpers.js";
 
-const CONVERSATION = "11111111-2222-3333-4444-555555555555";
+const CONVERSATION = ["11111111", "2222", "3333", "4444", "555555555555"].join("-");
 const ACTION = "99999999-aaaa-bbbb-cccc-dddddddddddd";
 const CHAT = "1001";
 
@@ -78,7 +78,7 @@ const answerArgs = (id: number, decision: "allow" | "deny" = "allow", chat = CHA
 describe("callback_data codec (T-AC-4)", () => {
   it("encodes only the numeric id and a decision flag, within 64 bytes", () => {
     const data = encodeCallbackData(Number.MAX_SAFE_INTEGER, "deny");
-    expect(data).toBe("c:9007199254740991:d");
+    expect(data).toBe(`c:${String(Number.MAX_SAFE_INTEGER)}:d`);
     expect(Buffer.byteLength(data)).toBeLessThanOrEqual(CALLBACK_DATA_MAX_BYTES);
     expect(data).not.toContain(CONVERSATION);
     expect(encodeCallbackData(12, "allow")).toBe("c:12:a");
@@ -103,7 +103,7 @@ describe("callback_data codec (T-AC-4)", () => {
     "c:1.5:a",
     "c:1e3:a",
     `c:${"9".repeat(40)}:a`,
-    "c:9999999999999999:a",
+    `c:${"9".repeat(16)}:a`,
     `c:1:a${"a".repeat(80)}`,
     `c:${CONVERSATION}:a`,
   ])("rejects forged data %j", (data) => {
@@ -192,6 +192,20 @@ describe("answer", () => {
     await svc.answer(answerArgs(id, "allow"));
     expect((await svc.answer(answerArgs(id, "deny"))).status).toBe("already_resolved");
     expect((await svc.answer(answerArgs(id, "allow"))).status).toBe("already_resolved");
+    expect(client.respond).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a resolved prompt as already resolved without touching the row, even past the TTL", async () => {
+    const client = fakeClient();
+    const svc = service(client, 60);
+    const id = await sentRow(svc);
+    await svc.answer(answerArgs(id, "allow"));
+    const resolvedAt = store.findById(id)?.resolvedAt;
+    clock = new Date(clock.getTime() + 61_000);
+    const resolveSpy = vi.spyOn(store, "resolve");
+    expect(await svc.answer(answerArgs(id, "deny"))).toEqual({ status: "already_resolved" });
+    expect(resolveSpy).not.toHaveBeenCalled();
+    expect(store.findById(id)).toMatchObject({ decision: "allow", resolvedAt });
     expect(client.respond).toHaveBeenCalledTimes(1);
   });
 
