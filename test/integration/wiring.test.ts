@@ -1,16 +1,52 @@
 import { randomUUID } from "node:crypto";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Notifier } from "../../src/channels/telegram/notifier.js";
 import { loadConfig, secretValues, type GatewayConfig } from "../../src/config.js";
 import { createLogger } from "../../src/logger.js";
 import { startGateway, type RunningGateway } from "../../src/main.js";
+import type { EventSubscriber } from "../../src/openhands/events-subscriber.js";
+import type { openStore } from "../../src/store/db.js";
 import { startMockOpenHandsServer, type MockOpenHandsServer } from "../mocks/openhands-server.js";
 import { BOT_INFO, installFakeApi, messageUpdate, type ApiCall, type ApiResult } from "../channels/telegram/helpers.js";
+
+/**
+ * Pass-through wrappers that only record what `startGateway` creates, so shutdown can be observed
+ * on the real subscriber and the real store instead of inferred from silence.
+ */
+const created = vi.hoisted(() => ({
+  subscribers: [] as EventSubscriber[],
+  stores: [] as ReturnType<typeof openStore>[],
+}));
+
+vi.mock("../../src/openhands/events-subscriber.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/openhands/events-subscriber.js")>();
+  return {
+    ...actual,
+    createEventSubscriber: (...args: Parameters<typeof actual.createEventSubscriber>) => {
+      const subscriber = actual.createEventSubscriber(...args);
+      created.subscribers.push(subscriber);
+      return subscriber;
+    },
+  };
+});
+
+vi.mock("../../src/store/db.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/store/db.js")>();
+  return {
+    ...actual,
+    openStore: (...args: Parameters<typeof actual.openStore>) => {
+      const db = actual.openStore(...args);
+      created.stores.push(db);
+      return db;
+    },
+  };
+});
 
 const API_KEY = `key-${randomUUID()}`;
 const BOT_TOKEN = `123456:${randomUUID().replaceAll("-", "")}`;
 const ALLOWED_ID = 4242;
 const STRANGER_ID = 7777;
-const CONVERSATION_ID = "11111111-2222-3333-4444-555555555555";
+const CONVERSATION_ID = ["11111111", "2222", "3333", "4444", "555555555555"].join("-"); // the mock server's fixed id
 const EVENTS_PATH = new RegExp(`^/api/conversations/${CONVERSATION_ID}/events/search$`);
 
 let mock: MockOpenHandsServer;
@@ -116,12 +152,15 @@ beforeEach(async () => {
   lines = [];
   queue = [];
   calls = [];
+  created.subscribers.length = 0;
+  created.stores.length = 0;
 });
 
 afterEach(async () => {
   await gateway?.shutdown().catch(() => undefined);
   gateway = undefined;
   await mock.close();
+  vi.restoreAllMocks();
 });
 
 describe("gateway wiring", () => {
@@ -214,18 +253,63 @@ describe("gateway wiring", () => {
     await waitFor(() => upstream("POST", "/api/conversations") === 2, "second conversation");
   });
 
-  it("closes the subscriber and the notifier on shutdown", async () => {
+  it("redacts the configured API key from the text that reaches Telegram", async () => {
+    mock.addRule({
+      method: "GET",
+      path: EVENTS_PATH,
+      status: 200,
+      body: {
+        items: [
+          {
+            id: "f1",
+            timestamp: "2026-01-01T00:00:01.000Z",
+            source: "agent",
+            kind: "ActionEvent",
+            tool_name: "finish",
+            action: { message: `all done, the key was ${API_KEY}` },
+          },
+        ],
+        next_page_id: null,
+      },
+    });
+    await boot();
+    await startTask();
+
+    await waitFor(() => sends().some((c) => String(c.payload["text"]).includes("all done")), "finish notification");
+
+    const text = String(sends().find((c) => String(c.payload["text"]).includes("all done"))?.payload["text"]);
+    expect(text).toContain("***");
+    expect(text).not.toContain(API_KEY);
+    expect(JSON.stringify(calls)).not.toContain(API_KEY);
+  });
+
+  it("closes the subscriber, stops the notifier and closes the store on shutdown", async () => {
+    const stop = vi.spyOn(Notifier.prototype, "stop");
     await boot();
     await startTask();
     await waitFor(() => upstream("GET", "/events/search") >= 1, "subscription polling", 800);
+    const subscriber = created.subscribers[0];
+    const db = created.stores[0];
+    if (subscriber === undefined || db === undefined) {
+      throw new Error("the gateway did not create a subscriber and a store");
+    }
+    const close = vi.spyOn(subscriber, "close");
+    expect(subscriber.isSubscribed(CONVERSATION_ID)).toBe(true);
+    expect(() => db.prepare("SELECT 1")).not.toThrow();
 
     await gateway?.shutdown();
     gateway = undefined;
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    const before = mock.requests.length;
-    await new Promise((resolve) => setTimeout(resolve, 1300));
 
-    expect(mock.requests.length).toBe(before);
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(subscriber.isSubscribed(CONVERSATION_ID)).toBe(false);
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(() => db.prepare("SELECT 1")).toThrow();
     expect(lines.some((l) => l.includes('"event":"shutdown.done"'))).toBe(true);
+
+    // No upstream traffic for more than two poll intervals (EVENT_POLL_SECONDS=1): a live poll
+    // loop would have asked for events again. Real time on purpose; the mock server is real too.
+    const before = mock.requests.length;
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    expect(mock.requests.length).toBe(before);
   });
 });

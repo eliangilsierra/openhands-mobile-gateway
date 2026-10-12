@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { Composer } from "grammy";
+import { describe, expect, it, vi } from "vitest";
 import { createBot, type BotHandlerDeps } from "../../../src/channels/telegram/bot.js";
 import { createLogger } from "../../../src/logger.js";
 import { BOT_INFO, installFakeApi, messageUpdate, type ApiCall } from "./helpers.js";
@@ -163,5 +164,105 @@ describe("createBot handler wiring", () => {
     expect(line).toContain("TypeError");
     expect(line).not.toContain("secret user text");
     expect(line).not.toContain("synthetic-token-value");
+  });
+});
+
+/** Control and submit dependencies carry different labels, so a test can tell which handler ran. */
+function labelledDeps(touched: string[]): BotHandlerDeps {
+  const dep = (name: string): unknown =>
+    new Proxy(
+      {},
+      {
+        get: (_target, member) => {
+          touched.push(`${name}.${String(member)}`);
+          // Throws synchronously, so the handler's own try/catch replies and nothing is left dangling.
+          return () => {
+            throw new Error("unexpected upstream call");
+          };
+        },
+      },
+    );
+  return {
+    registry: dep("registry"),
+    select: { registry: dep("select"), chatState: dep("select"), bindings: dep("select") },
+    submit: { registry: dep("submit"), chatState: dep("submit"), bindings: dep("submit"), client: dep("submit") },
+    control: { chatState: dep("control"), bindings: dep("control"), client: dep("control") },
+    confirmations: dep("confirmations"),
+  } as unknown as BotHandlerDeps;
+}
+
+function buildLabelled() {
+  const touched: string[] = [];
+  const bot = createBot({
+    token: "123456:synthetic-token-value",
+    allowedUserIds: new Set([ALLOWED]),
+    chatState: { find: () => null, setActiveProject: () => undefined } as never,
+    logger: createLogger({ level: "debug", secrets: [], write: () => undefined }),
+    handlers: labelledDeps(touched),
+  });
+  installFakeApi(bot, (call) =>
+    call.method === "getMe"
+      ? { ok: true, result: BOT_INFO }
+      : { ok: true, result: { message_id: 1, date: 1, chat: { id: 1, type: "private" } } },
+  );
+  return { bot, touched };
+}
+
+describe("createBot handler order", () => {
+  it.each([
+    ["/status", "control."],
+    ["/pause", "control."],
+    ["/resume", "control."],
+    ["/stop", "control."],
+    ["/projects", "registry."],
+  ])("routes the allowlisted command %s to its handler and never to the task submission", async (text, prefix) => {
+    const { bot, touched } = buildLabelled();
+    await bot.init();
+
+    await bot.handleUpdate(messageUpdate(1, ALLOWED, text));
+
+    expect(touched.some((entry) => entry.startsWith(prefix))).toBe(true);
+    expect(touched.filter((entry) => entry.startsWith("submit."))).toEqual([]);
+  });
+
+  it("routes plain text to the task submission and to no command handler (control case)", async () => {
+    const { bot, touched } = buildLabelled();
+    await bot.init();
+
+    await bot.handleUpdate(messageUpdate(1, ALLOWED, "build a thing"));
+
+    expect(touched.some((entry) => entry.startsWith("submit."))).toBe(true);
+    expect(touched.filter((entry) => entry.startsWith("control."))).toEqual([]);
+  });
+
+  it("registers the free-text handler after every command handler", () => {
+    // Behaviourally the text handler passes "/..." on, so moving it up changes nothing a message
+    // can observe; the order itself is the contract (a text handler that stopped passing commands
+    // on would silently turn /status into a task), hence this registration-order check.
+    const order: string[] = [];
+    const onSpy = vi.spyOn(Composer.prototype, "on").mockImplementation(function (this: unknown, filter: unknown) {
+      order.push(`on:${String(filter)}`);
+      return this as never;
+    });
+    const commandSpy = vi
+      .spyOn(Composer.prototype, "command")
+      .mockImplementation(function (this: unknown, command: unknown) {
+        order.push(`command:${String(command)}`);
+        return this as never;
+      });
+    try {
+      buildLabelled();
+    } finally {
+      onSpy.mockRestore();
+      commandSpy.mockRestore();
+    }
+
+    const textAt = order.indexOf("on:message:text");
+    expect(textAt).toBeGreaterThan(-1);
+    for (const name of ["projects", "use", "status", "pause", "resume", "stop"]) {
+      const at = order.indexOf(`command:${name}`);
+      expect(at, `command ${name} registered`).toBeGreaterThan(-1);
+      expect(at, `command ${name} before the text handler`).toBeLessThan(textAt);
+    }
   });
 });
