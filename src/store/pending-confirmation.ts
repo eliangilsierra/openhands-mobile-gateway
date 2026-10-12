@@ -109,6 +109,46 @@ export class PendingConfirmationRepository {
     return row ? toPendingConfirmation(row) : null;
   }
 
+  /** The newest confirmation for `(conversationId, actionEventId)`, or `null`. */
+  findByAction(conversationId: string, actionEventId: string): PendingConfirmation | null {
+    const row = withBusyRetry(this.logger, "pending_confirmation.find_by_action", () =>
+      this.db
+        .prepare(
+          "SELECT * FROM pending_confirmation WHERE conversation_id = ? AND action_event_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .get(conversationId, actionEventId),
+    ) as PendingConfirmationRow | undefined;
+
+    return row ? toPendingConfirmation(row) : null;
+  }
+
+  /** Records the id of the prompt message once it was sent. Returns `false` if no row matched. */
+  setChannelMessageId(id: number, channelMessageId: string): boolean {
+    const result = withBusyRetry(this.logger, "pending_confirmation.set_message_id", () =>
+      this.db
+        .prepare("UPDATE pending_confirmation SET channel_message_id = ? WHERE id = ?")
+        .run(channelMessageId, id),
+    );
+
+    return (result.changes as number) > 0;
+  }
+
+  /**
+   * Re-opens a row that was resolved with exactly `decision` (a claim whose upstream call
+   * provably did not happen), so the user can tap again. A no-op otherwise.
+   */
+  reopen(id: number, decision: string): boolean {
+    const result = withBusyRetry(this.logger, "pending_confirmation.reopen", () =>
+      this.db
+        .prepare(
+          "UPDATE pending_confirmation SET resolved_at = NULL, decision = NULL WHERE id = ? AND decision = ?",
+        )
+        .run(id, decision),
+    );
+
+    return (result.changes as number) > 0;
+  }
+
   /**
    * Resolves an unresolved confirmation with `decision` (e.g. `allow`/`deny`). A no-op (returns
    * `false`) when the row is already resolved or does not exist, so the caller's re-check that
