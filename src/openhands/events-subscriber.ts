@@ -3,6 +3,7 @@ import type { ApiKeyStatus, OpenHandsApiStatus } from "../health.js";
 import type { Logger } from "../logger.js";
 import { AuthError } from "./errors.js";
 import type { OpenHandsRestClient } from "./rest.js";
+import type { EventPage } from "./types.js";
 
 /**
  * Event subscriber (architecture §7.5, ADR-0006): one WebSocket per active conversation with
@@ -19,6 +20,20 @@ export const DEFAULT_WS_IDLE_SECONDS = 900;
 export const DEFAULT_WS_FAIL_THRESHOLD = 3;
 export const BACKOFF_BASE_MS = 1_000;
 export const BACKOFF_CAP_MS = 60_000;
+/** SR-1: largest frame accepted from the upstream (the `ws` default is 100 MiB). */
+export const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024;
+export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
+/** SR-2: events waiting for the consumer before the socket is dropped and replayed from the cursor. */
+export const DEFAULT_MAX_QUEUE = 1000;
+/** SR-3: a socket that stays open this long counts as healthy and resets the backoff. */
+export const DEFAULT_STABLE_MS = 30_000;
+/** CR-3: page size and page limit of one REST fallback poll. */
+const POLL_PAGE_LIMIT = 100;
+const POLL_MAX_PAGES = 20;
+const MAX_KIND_LENGTH = 64;
+const MAX_TIMESTAMP_LENGTH = 64;
+const EVENT_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+const TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:\d{2})?$/;
 /** Consecutive `4001` closes after which the subscription stops. */
 export const AUTH_FAILURE_LIMIT = 2;
 const WS_AUTH_FAILED_CODE = 4001;
@@ -35,7 +50,11 @@ export interface OpenHandsEvent {
   readonly [key: string]: unknown;
 }
 
-/** Called once per new event, in arrival order; the next one starts after the returned promise settles. */
+/**
+ * Called once per new event, in arrival order; the next one starts after the returned promise settles.
+ * The event comes from the upstream and is untrusted: do not merge it into other objects
+ * (`Object.assign`, deep merge); the subscriber already drops an own `__proto__` key.
+ */
 export type EventHandler = (event: OpenHandsEvent) => void | Promise<void>;
 
 /** Signals for the health module (#8): `openhands_api` and `api_key`. */
@@ -80,6 +99,13 @@ export interface EventSubscriberOptions {
   readonly onHealthSignal?: (signal: HealthSignal) => void;
   /** Called once when a subscription is stopped after repeated `4001`s, so the user can be told once. */
   readonly onAuthFailed?: (conversationId: string) => void;
+  /** SR-1: maximum accepted frame size in bytes (default 1 MiB). */
+  readonly maxFrameBytes?: number;
+  readonly handshakeTimeoutMs?: number;
+  /** SR-2: queue high-water mark before the socket is dropped (default 1000). */
+  readonly maxQueue?: number;
+  /** SR-3: how long a socket must stay open to reset the backoff (default 30 s). */
+  readonly stableMs?: number;
   readonly createSocket?: (url: string) => EventSocket;
   readonly random?: () => number;
 }
@@ -110,9 +136,21 @@ function parseEvent(value: unknown): OpenHandsEvent | null {
   }
   const record = value as Record<string, unknown>;
   const { id, timestamp, kind } = record;
-  if (typeof id !== "string" || id === "" || typeof timestamp !== "string" || typeof kind !== "string") {
+  if (
+    typeof id !== "string" ||
+    !EVENT_ID_PATTERN.test(id) ||
+    typeof timestamp !== "string" ||
+    timestamp.length > MAX_TIMESTAMP_LENGTH ||
+    !TIMESTAMP_PATTERN.test(timestamp) ||
+    !Number.isFinite(Date.parse(timestamp)) ||
+    typeof kind !== "string" ||
+    kind.length > MAX_KIND_LENGTH
+  ) {
     return null;
   }
+  // SR-6: JSON.parse makes `__proto__` an own data property; remove it so a consumer that merges
+  // the event cannot be surprised by it.
+  delete record["__proto__"];
   // Safe: the three envelope fields were just checked; everything else is intentionally open.
   return record as OpenHandsEvent;
 }
@@ -131,10 +169,18 @@ function errType(error: unknown): string {
   return error instanceof Error ? error.name : typeof error;
 }
 
+/** SR-4: only http(s)/ws(s), no credentials, query or fragment; the key travels to this host. */
 function toSocketBase(baseUrl: string): string {
   const url = new URL(baseUrl);
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  return url.href.replace(/\/+$/, "");
+  const scheme: Record<string, string> = { "http:": "ws:", "https:": "wss:", "ws:": "ws:", "wss:": "wss:" };
+  const protocol = scheme[url.protocol];
+  if (protocol === undefined) {
+    throw new TypeError("OpenHands base URL must use http, https, ws or wss");
+  }
+  if (url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "") {
+    throw new TypeError("OpenHands base URL must not contain credentials, a query or a fragment");
+  }
+  return `${protocol}//${url.host}${url.pathname.replace(/\/+$/, "")}`;
 }
 
 interface Subscription {
@@ -146,6 +192,13 @@ interface Subscription {
   terminal: boolean;
   socket: EventSocket | null;
   open: boolean;
+  /** An event was handed off on the current socket, or it stayed open long enough (SR-3). */
+  healthy: boolean;
+  /** Queue overflowed: reconnect once the consumer has caught up (SR-2). */
+  resumeAfterDrain: boolean;
+  pollGen: number;
+  polling: boolean;
+  stableTimer: ReturnType<typeof setTimeout> | null;
   openFailures: number;
   reconnectAttempt: number;
   authStrikes: number;
@@ -160,9 +213,23 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
   const pollMs = (options.eventPollSeconds ?? DEFAULT_EVENT_POLL_SECONDS) * 1000;
   const idleMs = (options.wsIdleSeconds ?? DEFAULT_WS_IDLE_SECONDS) * 1000;
   const failThreshold = options.wsFailThreshold ?? DEFAULT_WS_FAIL_THRESHOLD;
-  const createSocket = options.createSocket ?? ((url: string): EventSocket => new WebSocket(url));
+  const maxFrameBytes = options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
+  const handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
+  const maxQueue = options.maxQueue ?? DEFAULT_MAX_QUEUE;
+  const stableMs = options.stableMs ?? DEFAULT_STABLE_MS;
+  const createSocket =
+    options.createSocket ??
+    ((url: string): EventSocket =>
+      new WebSocket(url, {
+        maxPayload: maxFrameBytes,
+        handshakeTimeout: handshakeTimeoutMs,
+        perMessageDeflate: false,
+        followRedirects: false,
+      }));
   const socketBase = toSocketBase(options.baseUrl);
   const subscriptions = new Map<string, Subscription>();
+  /** Last drain per conversation: a re-subscription waits for it so two consumers never overlap (CR-5). */
+  const tails = new Map<string, Promise<void>>();
 
   function signal(value: HealthSignal): void {
     try {
@@ -178,33 +245,53 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
 
   // ---- delivery: single consumer per conversation -------------------------------------------
 
-  function enqueue(sub: Subscription, event: OpenHandsEvent): void {
+  /** Returns false when the queue is full and the event was not accepted (SR-2). */
+  function enqueue(sub: Subscription, event: OpenHandsEvent): boolean {
     if (sub.stopped) {
-      return;
+      return true;
+    }
+    if (sub.queue.length >= maxQueue) {
+      return false;
     }
     sub.queue.push(event);
     if (sub.terminal) {
       armIdleTimer(sub);
     }
     void drain(sub);
+    return true;
   }
 
-  async function drain(sub: Subscription): Promise<void> {
+  function drain(sub: Subscription): Promise<void> {
     if (sub.draining) {
-      return;
+      return Promise.resolve();
     }
     sub.draining = true;
-    try {
-      while (!sub.stopped) {
-        const event = sub.queue.shift();
-        if (event === undefined) {
-          break;
+    const previous = tails.get(sub.id);
+    let run: Promise<void> | undefined;
+    run = (async (): Promise<void> => {
+      try {
+        // Always yields once, so `run` is assigned before the `finally` below can look at it.
+        await previous;
+        while (!sub.stopped) {
+          const event = sub.queue.shift();
+          if (event === undefined) {
+            break;
+          }
+          await deliver(sub, event);
         }
-        await deliver(sub, event);
+      } finally {
+        sub.draining = false;
+        if (tails.get(sub.id) === run) {
+          tails.delete(sub.id);
+        }
+        if (sub.resumeAfterDrain && !sub.stopped && sub.queue.length === 0) {
+          sub.resumeAfterDrain = false;
+          scheduleReconnect(sub);
+        }
       }
-    } finally {
-      sub.draining = false;
-    }
+    })();
+    tails.set(sub.id, run);
+    return run;
   }
 
   async function deliver(sub: Subscription, event: OpenHandsEvent): Promise<void> {
@@ -221,8 +308,15 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
       // Only after the hand-off: a crash here re-delivers (at-least-once) instead of losing the event.
       options.transaction(() => {
         options.seen.markSeen(sub.id, event.id);
-        options.cursors.advance(sub.id, event.id, event.timestamp);
+        // CR-1: the cursor never moves backwards, whatever order the events were handed over in.
+        const current = options.cursors.read(sub.id)?.lastEventTimestamp ?? null;
+        if (current === null || Date.parse(event.timestamp) >= Date.parse(current)) {
+          options.cursors.advance(sub.id, event.id, event.timestamp);
+        }
       });
+      if (sub.open) {
+        markHealthy(sub);
+      }
       logger?.debug("Event delivered", {
         event: "event.received",
         conversation_id: sub.id,
@@ -238,7 +332,46 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
         err_type: errType(error),
       });
       sub.queue.length = 0;
-      sub.socket?.close();
+      if (!sub.stopped) {
+        abandonSocket(sub, 1011);
+      }
+    }
+  }
+
+  /** A hand-off succeeded on a live socket, or the socket proved stable: backoff starts over (SR-3). */
+  function markHealthy(sub: Subscription): void {
+    sub.healthy = true;
+    sub.openFailures = 0;
+    sub.reconnectAttempt = 0;
+  }
+
+  /**
+   * Detaches the current socket before closing it (CR-1): from here on its listeners ignore every
+   * frame, so nothing arrives out of order behind the event that failed, and the reconnect is
+   * scheduled here because the detached socket's `close` event is ignored too.
+   */
+  function abandonSocket(sub: Subscription, code: number, reconnect = true): void {
+    const { socket } = sub;
+    sub.socket = null;
+    sub.open = false;
+    sub.healthy = false;
+    clearStableTimer(sub);
+    if (socket !== null) {
+      try {
+        socket.close(code);
+      } catch {
+        // Already closing; nothing left to release.
+      }
+    }
+    if (reconnect) {
+      handleClosed(sub, null);
+    }
+  }
+
+  function clearStableTimer(sub: Subscription): void {
+    if (sub.stableTimer !== null) {
+      clearTimeout(sub.stableTimer);
+      sub.stableTimer = null;
     }
   }
 
@@ -283,21 +416,27 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
         conversation_id: sub.id,
         err_type: errType(error),
       });
-      handleClosed(sub, null, false);
+      handleClosed(sub, null);
       return;
     }
     sub.socket = socket;
-    let opened = false;
+    sub.healthy = false;
     let closed = false;
 
     socket.addEventListener("open", () => {
       if (sub.stopped || sub.socket !== socket) {
         return;
       }
-      opened = true;
       sub.open = true;
-      sub.openFailures = 0;
-      sub.reconnectAttempt = 0;
+      // SR-3: opening proves nothing (accept-then-close, poison event); the backoff only resets after
+      // a delivered event or a socket that stays open for `stableMs`.
+      clearStableTimer(sub);
+      sub.stableTimer = setTimeout(() => {
+        sub.stableTimer = null;
+        if (!sub.stopped && sub.socket === socket) {
+          markHealthy(sub);
+        }
+      }, stableMs);
       stopPolling(sub);
       signal({ openhandsApi: "reachable" });
       logger?.info("Event socket connected", { event: "ws.connected", conversation_id: sub.id });
@@ -327,9 +466,14 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
       if (sub.socket === socket) {
         sub.socket = null;
         sub.open = false;
-        handleClosed(sub, code, opened);
+        clearStableTimer(sub);
+        handleClosed(sub, code);
       }
     };
+    let opened = false;
+    socket.addEventListener("open", () => {
+      opened = true;
+    });
     socket.addEventListener("error", () => {
       // Once open, a `close` event follows and carries the code. A failed handshake (refused,
       // reset) may only emit `error`, so it has to end the attempt by itself.
@@ -353,10 +497,15 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
       logger?.warn("Ignoring a frame that is not an event", { event: "event.invalid", conversation_id: sub.id });
       return;
     }
-    enqueue(sub, event);
+    if (!enqueue(sub, event)) {
+      // SR-2: stop reading; what is queued is still delivered, then we reconnect from the cursor.
+      logger?.warn("Event queue full; dropping the socket", { event: "ws.queue_full", conversation_id: sub.id });
+      sub.resumeAfterDrain = true;
+      abandonSocket(sub, 1013, false);
+    }
   }
 
-  function handleClosed(sub: Subscription, code: number | null, opened: boolean): void {
+  function handleClosed(sub: Subscription, code: number | null): void {
     if (sub.stopped) {
       return;
     }
@@ -372,7 +521,7 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
         return;
       }
     }
-    if (!opened) {
+    if (!sub.healthy) {
       sub.openFailures += 1;
       if (sub.openFailures >= failThreshold) {
         signal({ openhandsApi: "unreachable" });
@@ -416,14 +565,17 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
   // ---- REST fallback --------------------------------------------------------------------------
 
   function startPolling(sub: Subscription): void {
-    if (sub.pollTimer !== null || sub.stopped) {
+    // CR-5: `polling` covers the whole loop, including a request in flight (the timer is null then).
+    if (sub.polling || sub.stopped) {
       return;
     }
+    sub.polling = true;
+    const gen = sub.pollGen;
     logger?.warn("Falling back to REST polling", { event: "ws.poll_fallback", conversation_id: sub.id });
     const run = (): void => {
       sub.pollTimer = null;
       void poll(sub).finally(() => {
-        if (!sub.stopped && !sub.open && sub.pollTimer === null) {
+        if (!sub.stopped && !sub.open && sub.pollGen === gen) {
           sub.pollTimer = setTimeout(run, pollMs);
         }
       });
@@ -432,6 +584,8 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
   }
 
   function stopPolling(sub: Subscription): void {
+    sub.polling = false;
+    sub.pollGen += 1;
     if (sub.pollTimer !== null) {
       clearTimeout(sub.pollTimer);
       sub.pollTimer = null;
@@ -441,20 +595,42 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
   async function poll(sub: Subscription): Promise<void> {
     try {
       const cursor = readCursor(sub);
-      const page = await options.client.searchEvents(sub.id, cursor === null ? {} : { timestamp__gte: cursor });
-      if (sub.stopped) {
-        return;
-      }
-      for (const item of page.items ?? []) {
-        const event = parseEvent(item);
-        if (event === null) {
-          logger?.warn("Ignoring an item that is not an event", {
-            event: "event.invalid",
-            conversation_id: sub.id,
-          });
-          continue;
+      const gen = sub.pollGen;
+      const collected: OpenHandsEvent[] = [];
+      let pageId: string | null = null;
+      // CR-3: oldest first, every page up to a bound; the remainder is picked up by the next poll.
+      for (let pages = 0; pages < POLL_MAX_PAGES; pages += 1) {
+        const page: EventPage = await options.client.searchEvents(sub.id, {
+          ...(cursor === null ? {} : { timestamp__gte: cursor }),
+          sort_order: "TIMESTAMP",
+          limit: POLL_PAGE_LIMIT,
+          ...(pageId === null ? {} : { page_id: pageId }),
+        });
+        if (sub.stopped || sub.pollGen !== gen) {
+          return;
         }
-        enqueue(sub, event);
+        for (const item of page.items ?? []) {
+          const event = parseEvent(item);
+          if (event === null) {
+            logger?.warn("Ignoring an item that is not an event", {
+              event: "event.invalid",
+              conversation_id: sub.id,
+            });
+            continue;
+          }
+          collected.push(event);
+        }
+        pageId = typeof page.next_page_id === "string" && page.next_page_id !== "" ? page.next_page_id : null;
+        if (pageId === null) {
+          break;
+        }
+      }
+      // Never rely on the server's order: the cursor follows the first delivered event.
+      collected.sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+      for (const event of collected) {
+        if (!enqueue(sub, event)) {
+          break;
+        }
       }
     } catch (error) {
       logger?.warn("Event poll failed", {
@@ -493,6 +669,7 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
     sub.stopped = true;
     sub.queue.length = 0;
     clearIdleTimer(sub);
+    clearStableTimer(sub);
     stopPolling(sub);
     if (sub.reconnectTimer !== null) {
       clearTimeout(sub.reconnectTimer);
@@ -531,6 +708,11 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
         terminal: false,
         socket: null,
         open: false,
+        healthy: false,
+        resumeAfterDrain: false,
+        pollGen: 0,
+        polling: false,
+        stableTimer: null,
         openFailures: 0,
         reconnectAttempt: 0,
         authStrikes: 0,
