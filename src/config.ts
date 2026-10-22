@@ -33,12 +33,15 @@ export interface GatewayConfig {
   readonly wsIdleSeconds: number;
   /** Largest accepted task text, in characters. */
   readonly maxTaskChars: number;
+  /** Days after which inactive bindings are pruned and unanswered confirmations expire. */
+  readonly retentionDays: number;
 }
 
 /** Upper bounds keep a typo from disabling polling, idling forever or accepting multi-MB tasks. */
 export const MAX_EVENT_POLL_SECONDS = 300;
 export const MAX_WS_IDLE_SECONDS = 86_400;
 export const MAX_TASK_CHARS_LIMIT = 32_000;
+export const MAX_RETENTION_DAYS = 3650;
 
 /** Raised when the environment fails validation. Never carries a raw secret value. */
 export class ConfigError extends Error {
@@ -175,6 +178,7 @@ const EnvSchema = z.object({
   EVENT_POLL_SECONDS: boundedInteger("EVENT_POLL_SECONDS", "5", 1, MAX_EVENT_POLL_SECONDS),
   WS_IDLE_SECONDS: boundedInteger("WS_IDLE_SECONDS", "900", 1, MAX_WS_IDLE_SECONDS),
   MAX_TASK_CHARS: boundedInteger("MAX_TASK_CHARS", "8000", 1, MAX_TASK_CHARS_LIMIT),
+  RETENTION_DAYS: boundedInteger("RETENTION_DAYS", "30", 1, MAX_RETENTION_DAYS),
 });
 
 /** The environment variable names `config.ts` reads. Kept in sync with `.env.example`. */
@@ -194,6 +198,7 @@ export const CONFIG_ENV_KEYS = [
   "EVENT_POLL_SECONDS",
   "WS_IDLE_SECONDS",
   "MAX_TASK_CHARS",
+  "RETENTION_DAYS",
 ] as const;
 
 /** Secret values the logger's redaction hook must never emit (architecture §9.2). */
@@ -251,5 +256,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     eventPollSeconds: parsed.EVENT_POLL_SECONDS,
     wsIdleSeconds: parsed.WS_IDLE_SECONDS,
     maxTaskChars: parsed.MAX_TASK_CHARS,
+    retentionDays: parsed.RETENTION_DAYS,
   };
 }

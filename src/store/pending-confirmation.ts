@@ -1,6 +1,10 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { Logger } from "../logger.js";
+import { cutoffIso } from "./cutoff.js";
 import { withBusyRetry } from "./retry.js";
+
+/** `decision` recorded on a confirmation that nobody answered before it expired. */
+export const EXPIRED_DECISION = "expired";
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -164,6 +168,26 @@ export class PendingConfirmationRepository {
     );
 
     return (result.changes as number) > 0;
+  }
+
+  /**
+   * Expiry policy for a prompt nobody answered: resolves every unresolved confirmation created
+   * more than `maxAgeMs` ago with decision {@link EXPIRED_DECISION}, so it can no longer block the
+   * retention of its binding. A later tap finds it already resolved (T-B1-3) and does nothing.
+   * Younger confirmations are never touched. Returns the number of rows expired.
+   */
+  expireUnresolved(maxAgeMs: number): number {
+    const now = this.now();
+    const cutoff = cutoffIso(now, maxAgeMs);
+    const result = withBusyRetry(this.logger, "pending_confirmation.expire_unresolved", () =>
+      this.db
+        .prepare(
+          "UPDATE pending_confirmation SET resolved_at = ?, decision = ? WHERE resolved_at IS NULL AND created_at < ?",
+        )
+        .run(now.toISOString(), EXPIRED_DECISION, cutoff),
+    );
+
+    return Number(result.changes);
   }
 
   /** Deletes confirmations resolved more than 7 days ago. Returns the number of rows deleted. */

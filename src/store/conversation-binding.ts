@@ -1,6 +1,8 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { Logger } from "../logger.js";
+import { cutoffIso } from "./cutoff.js";
 import { withBusyRetry } from "./retry.js";
+import { runInTransaction } from "./transaction.js";
 
 export type ConversationBindingState = "active" | "stale" | "closed";
 
@@ -147,29 +149,30 @@ export class ConversationBindingRepository {
 
   /**
    * Retention: deletes `closed` and `stale` bindings whose `last_used_at` is older than
-   * `maxAgeMs`. Never deletes `active` bindings, and keeps any binding whose conversation still
-   * has an unresolved `pending_confirmation` (it is needed to answer the prompt). Returns the
-   * number of rows deleted.
+   * `maxAgeMs` (strictly: a binding exactly `maxAgeMs` old is kept), together with the
+   * `event_cursor` and `seen_event` rows of the pruned conversations, in one transaction. Never
+   * deletes `active` bindings, nor a binding whose conversation still has an unresolved
+   * `pending_confirmation` (it is needed to answer the prompt), nor the replay/dedupe rows of
+   * those. Returns the number of bindings deleted. Must not run inside another transaction.
    */
   pruneInactive(maxAgeMs: number): number {
-    if (!Number.isFinite(maxAgeMs) || maxAgeMs < 0) {
-      throw new RangeError("maxAgeMs must be a non-negative finite number");
-    }
-    const cutoff = new Date(this.now().getTime() - maxAgeMs).toISOString();
-    const result = withBusyRetry(this.logger, "conversation_binding.prune_inactive", () =>
-      this.db
-        .prepare(
-          `DELETE FROM conversation_binding
+    const cutoff = cutoffIso(this.now(), maxAgeMs);
+    const doomed = `SELECT conversation_id FROM conversation_binding
            WHERE state IN ('closed', 'stale')
              AND last_used_at < ?
              AND NOT EXISTS (
                SELECT 1 FROM pending_confirmation pc
                WHERE pc.conversation_id = conversation_binding.conversation_id
                  AND pc.resolved_at IS NULL
-             )`,
-        )
-        .run(cutoff),
-    );
-    return Number(result.changes);
+             )`;
+    // The bindings go last so the candidate set is identical for the three statements.
+    return runInTransaction(this.db, this.logger, () => {
+      this.db.prepare(`DELETE FROM event_cursor WHERE conversation_id IN (${doomed})`).run(cutoff);
+      this.db.prepare(`DELETE FROM seen_event WHERE conversation_id IN (${doomed})`).run(cutoff);
+      const result = this.db
+        .prepare(`DELETE FROM conversation_binding WHERE conversation_id IN (${doomed})`)
+        .run(cutoff);
+      return Number(result.changes);
+    });
   }
 }

@@ -1,6 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { Logger } from "../logger.js";
 import { withBusyRetry } from "./retry.js";
+import { runInTransaction } from "./transaction.js";
 
 /** `chat_state` row (architecture §8): the active project remembered for one Telegram chat. */
 export interface ChatState {
@@ -87,7 +88,8 @@ export class ChatStateRepository {
 
   /**
    * Deletes the state of one chat on request (retention policy, see `src/store/README.md`).
-   * Returns `true` when a row existed. Bindings and dedupe rows are left untouched.
+   * Returns `true` when a row existed. Bindings, confirmations and dedupe rows are left untouched:
+   * this is NOT a full erasure, use {@link eraseChat} for that.
    */
   delete(channel: string, externalChatId: string): boolean {
     const result = withBusyRetry(this.logger, "chat_state.delete", () =>
@@ -97,4 +99,45 @@ export class ChatStateRepository {
     );
     return Number(result.changes) > 0;
   }
+
+  /**
+   * Full erasure of one chat in a single transaction: its `chat_state` row, every binding of the
+   * chat (any state, including `active`) with the `event_cursor` and `seen_event` rows of those
+   * conversations, and the chat's `pending_confirmation` rows. Other chats are untouched. Nothing
+   * calls it yet (`/forget` is out of V1 scope); it exists so erasure on request is possible.
+   * Must not run inside another transaction.
+   */
+  eraseChat(channel: string, externalChatId: string): EraseChatResult {
+    return runInTransaction(this.db, this.logger, () => {
+      const conversations = `SELECT conversation_id FROM conversation_binding
+        WHERE channel = ? AND external_chat_id = ?`;
+      this.db
+        .prepare(`DELETE FROM event_cursor WHERE conversation_id IN (${conversations})`)
+        .run(channel, externalChatId);
+      this.db
+        .prepare(`DELETE FROM seen_event WHERE conversation_id IN (${conversations})`)
+        .run(channel, externalChatId);
+      const confirmations = this.db
+        .prepare("DELETE FROM pending_confirmation WHERE channel = ? AND external_chat_id = ?")
+        .run(channel, externalChatId);
+      const bindings = this.db
+        .prepare("DELETE FROM conversation_binding WHERE channel = ? AND external_chat_id = ?")
+        .run(channel, externalChatId);
+      const state = this.db
+        .prepare("DELETE FROM chat_state WHERE channel = ? AND external_chat_id = ?")
+        .run(channel, externalChatId);
+      return {
+        chatState: Number(state.changes) > 0,
+        bindings: Number(bindings.changes),
+        confirmations: Number(confirmations.changes),
+      };
+    });
+  }
+}
+
+/** What {@link ChatStateRepository.eraseChat} removed. */
+export interface EraseChatResult {
+  readonly chatState: boolean;
+  readonly bindings: number;
+  readonly confirmations: number;
 }
