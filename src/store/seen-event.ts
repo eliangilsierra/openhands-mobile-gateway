@@ -82,4 +82,19 @@ export class SeenEventRepository {
 
     return result.changes as number;
   }
+
+  /**
+   * Runs {@link prune} for every conversation that has `seen_event` rows (the scheduled job has no
+   * conversation list of its own). Returns the total number of rows deleted.
+   */
+  pruneAll(options: PruneSeenEventsOptions = {}): number {
+    const rows = withBusyRetry(this.logger, "seen_event.list_conversations", () =>
+      this.db.prepare("SELECT DISTINCT conversation_id FROM seen_event").all(),
+    );
+    let deleted = 0;
+    for (const row of rows) {
+      deleted += this.prune(String(row["conversation_id"]), options);
+    }
+    return deleted;
+  }
 }

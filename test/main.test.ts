@@ -1,4 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConfigError, loadConfig, secretValues, type GatewayConfig } from "../src/config.js";
 import { createLogger } from "../src/logger.js";
@@ -9,6 +13,7 @@ import {
   startGateway,
   type RunningGateway,
 } from "../src/main.js";
+import { closeStore, openStore } from "../src/store/db.js";
 import { startMockOpenHandsServer, type MockOpenHandsServer } from "./mocks/openhands-server.js";
 import {
   BOT_INFO,
@@ -435,5 +440,102 @@ describe("installProcessHandlers", () => {
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
 
     expect(lines.join("\n")).not.toContain("shutdown.failed");
+  });
+});
+
+describe("retention scheduling (issue #44)", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  let dir: string;
+  let dbPath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "gateway-retention-"));
+    dbPath = join(dir, "gateway.db");
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function seedBinding(db: DatabaseSync, id: string, state: string, daysAgo: number): void {
+    const lastUsed = new Date(Date.now() - daysAgo * DAY).toISOString();
+    db.prepare(
+      "INSERT INTO conversation_binding (channel, external_chat_id, project_key, working_dir, conversation_id, state, created_at, last_used_at) VALUES (?,?,?,?,?,?,?,?)",
+    ).run("telegram", id, "alpha", "/p", id, state, "t", lastUsed);
+    db.prepare("INSERT INTO seen_event (conversation_id, event_id, seen_at) VALUES (?,?,?)").run(id, "e1", lastUsed);
+    db.prepare("INSERT INTO event_cursor (conversation_id, last_event_id, updated_at) VALUES (?,?,?)").run(
+      id,
+      "e1",
+      lastUsed,
+    );
+  }
+
+  function count(db: DatabaseSync, table: string): number {
+    return Number(db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()?.["n"]);
+  }
+
+  function openSeedStore(): DatabaseSync {
+    return openStore({ databasePath: dbPath, logger: createLogger({ level: "error", secrets: [], write: () => undefined }) });
+  }
+
+  it("AC-1: prunes at startup and then periodically, using the configured RETENTION_DAYS", async () => {
+    const seed = openSeedStore();
+    seedBinding(seed, "old-closed", "closed", 40);
+    seedBinding(seed, "fresh-closed", "closed", 5);
+    seedBinding(seed, "old-active", "active", 400);
+    const config = baseConfig({ databasePath: dbPath, retentionDays: 30 });
+    gateway = await startGateway(config, {
+      logger: testLogger(config),
+      retentionIntervalMs: 20,
+      configureBot: (bot) => fakeTransport(bot, {}),
+    });
+    // Startup pass: the old closed binding and its replay rows are gone; the others are kept.
+    expect(count(seed, "conversation_binding")).toBe(2);
+    expect(count(seed, "event_cursor")).toBe(2);
+    expect(lines.some((line) => line.includes('"event":"retention.done"'))).toBe(true);
+
+    // Periodic pass: a binding that becomes prunable later is removed without a restart.
+    seedBinding(seed, "late-stale", "stale", 90);
+    await waitFor(() => count(seed, "conversation_binding") === 2 && count(seed, "seen_event") === 2, "periodic prune");
+    const left = seed.prepare("SELECT conversation_id FROM conversation_binding ORDER BY id").all();
+    expect(left.map((row) => row["conversation_id"])).toEqual(["fresh-closed", "old-active"]);
+    closeStore(seed);
+  });
+
+  it("AC-1: RETENTION_DAYS decides the age (a 10-day-old closed binding stays with 30 days, goes with 7)", async () => {
+    const seed = openSeedStore();
+    seedBinding(seed, "ten-days", "closed", 10);
+    const config = baseConfig({ databasePath: dbPath, retentionDays: 30 });
+    gateway = await startGateway(config, {
+      logger: testLogger(config),
+      configureBot: (bot) => fakeTransport(bot, {}),
+    });
+    expect(count(seed, "conversation_binding")).toBe(1);
+    await gateway.shutdown();
+    gateway = undefined;
+
+    const config7 = baseConfig({ databasePath: dbPath, retentionDays: 7 });
+    gateway = await startGateway(config7, {
+      logger: testLogger(config7),
+      configureBot: (bot) => fakeTransport(bot, {}),
+    });
+    expect(count(seed, "conversation_binding")).toBe(0);
+    closeStore(seed);
+  });
+
+  it("AC-1: the timer stops on shutdown (no pass runs against the closed store)", async () => {
+    const config = baseConfig({ databasePath: dbPath });
+    gateway = await startGateway(config, {
+      logger: testLogger(config),
+      retentionIntervalMs: 10,
+      configureBot: (bot) => fakeTransport(bot, {}),
+    });
+    await waitFor(() => lines.filter((line) => line.includes('"event":"retention.done"')).length >= 2, "two passes");
+    await gateway.shutdown();
+    gateway = undefined;
+    const after = lines.length;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(lines.slice(after).filter((line) => line.includes('"event":"retention.'))).toEqual([]);
+    expect(lines.some((line) => line.includes('"event":"retention.failed"'))).toBe(false);
   });
 });

@@ -19,6 +19,7 @@ import { ConversationBindingRepository } from "./store/conversation-binding.js";
 import { closeStore, openStore } from "./store/db.js";
 import { EventCursorRepository } from "./store/event-cursor.js";
 import { PendingConfirmationRepository } from "./store/pending-confirmation.js";
+import { scheduleRetention } from "./store/retention.js";
 import { SeenEventRepository } from "./store/seen-event.js";
 import { runInTransaction } from "./store/transaction.js";
 
@@ -119,6 +120,8 @@ export interface StartGatewayOptions {
   readonly shutdownDeadlineMs?: number;
   /** Called with the bot before polling starts, so tests can replace the Telegram transport. */
   readonly configureBot?: (bot: Bot<Context>) => void;
+  /** Interval of the retention job in ms; defaults to one hour. */
+  readonly retentionIntervalMs?: number;
 }
 
 export interface RunningGateway {
@@ -388,6 +391,7 @@ export async function startGateway(
   let notifier: Notifier | undefined;
   let subscriber: EventSubscriber | undefined;
   let server: Awaited<ReturnType<typeof startHealthServer>>;
+  let stopRetention: (() => void) | undefined;
   try {
     const client = createOpenHandsRestClient({
       baseUrl: config.openhandsBaseUrl,
@@ -396,8 +400,10 @@ export async function startGateway(
     });
     const chatState = new ChatStateRepository(db, logger);
     const bindings = new ConversationBindingRepository(db, logger);
+    const pendingConfirmations = new PendingConfirmationRepository(db, logger);
+    const seenEvents = new SeenEventRepository(db, logger);
     const confirmations = new ConfirmationService({
-      store: new PendingConfirmationRepository(db, logger),
+      store: pendingConfirmations,
       client,
       logger,
     });
@@ -464,7 +470,7 @@ export async function startGateway(
       baseUrl: config.openhandsBaseUrl,
       apiKey: config.openhandsApiKey,
       cursors: new EventCursorRepository(db, logger),
-      seen: new SeenEventRepository(db, logger),
+      seen: seenEvents,
       transaction: (fn) => runInTransaction(db, logger, fn),
       client,
       logger,
@@ -501,6 +507,17 @@ export async function startGateway(
       logger,
     });
     server = await startHealthServer(health, config.healthPort, { host: config.healthHost, logger });
+    // Last step of startup, so a failed start never leaves a timer behind: prunes now and hourly.
+    stopRetention = scheduleRetention(
+      {
+        bindings,
+        confirmations: pendingConfirmations,
+        seen: seenEvents,
+        logger,
+        retentionDays: config.retentionDays,
+      },
+      options.retentionIntervalMs,
+    );
   } catch (error) {
     subscriber?.close();
     notifier?.stop();
@@ -519,6 +536,7 @@ export async function startGateway(
   const shutdown = (): Promise<void> => {
     stopping ??= withDeadline(
       (async () => {
+        stopRetention?.();
         abort.abort();
         await polling;
         runningSubscriber.close();

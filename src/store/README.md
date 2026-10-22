@@ -45,22 +45,32 @@ outside `src/store/` must never write SQL themselves.
 | `conversation-binding.ts` | `conversation_binding` | the partial unique index (migration 001) enforces one active binding per `(channel, externalChatId, projectKey)`; repositories do not pre-check it, they let the constraint error propagate |
 | `event-cursor.ts` | `event_cursor` | resume point for WS reconnect/replay |
 | `seen-event.ts` | `seen_event` | dedupe set; `prune()` keeps the most recent `SEEN_EVENT_KEEP` rows (default 2000) or 7 days, whichever is larger |
-| `pending-confirmation.ts` | `pending_confirmation` | Allow/Deny prompts; `prune()` deletes rows resolved more than 7 days ago |
+| `pending-confirmation.ts` | `pending_confirmation` | Allow/Deny prompts; `expireUnresolved()` expires unanswered ones, `prune()` deletes rows resolved more than 7 days ago |
+| `retention.ts` | (all) | the scheduled retention pass described below |
 | `schema-migration.ts` | `schema_migration` | the migration runner plus read-only access to the applied version |
 
 ### Retention of personal identifiers
 
 `chat_state` and `conversation_binding` hold chat and conversation IDs, so they are not kept
-forever (issue #27):
+forever. `src/store/retention.ts` runs one pass at startup and then hourly (`main.ts` schedules it
+and stops the timer on shutdown); `RETENTION_DAYS` (default 30) is the age. Each pass, in order:
 
-- `ChatStateRepository.delete(channel, externalChatId)` removes one chat's state on request.
-- `ConversationBindingRepository.pruneInactive(maxAgeMs)` deletes `closed` and `stale` bindings
-  whose `last_used_at` is older than `maxAgeMs` (the caller chooses the age, e.g. from
-  configuration). `active` bindings are never deleted, nor are bindings whose conversation has an
-  unresolved `pending_confirmation`. `seen_event` and `event_cursor` are not touched, so
-  dedupe/replay is unaffected.
+1. `PendingConfirmationRepository.expireUnresolved(maxAgeMs)`: a prompt nobody answered within the
+   age is resolved with decision `expired`, so it cannot pin its binding forever. A late tap finds
+   it resolved and does nothing.
+2. `ConversationBindingRepository.pruneInactive(maxAgeMs)`: deletes `closed` and `stale` bindings
+   whose `last_used_at` is strictly older than `maxAgeMs`, and in the same transaction the
+   `event_cursor` and `seen_event` rows of those conversations. `active` bindings and bindings with
+   an unresolved confirmation are never deleted (nor their replay rows). An oversized or invalid
+   `maxAgeMs` throws `RangeError`.
+3. `PendingConfirmationRepository.prune()`: deletes confirmations resolved more than 7 days ago.
+4. `SeenEventRepository.pruneAll()`: the per-conversation `seen_event` prune for every conversation.
 
-Nothing calls these yet; scheduling the prune job in `main.ts` is a follow-up.
+Erasure on request: `ChatStateRepository.delete(channel, externalChatId)` removes **only** the
+`chat_state` row; it is not a full erasure. `ChatStateRepository.eraseChat(channel, externalChatId)`
+removes, in one transaction, the chat's `chat_state`, all its bindings (any state, including
+`active`) with their `event_cursor` and `seen_event` rows, and its `pending_confirmation` rows. No
+command calls it yet (`/forget` is out of V1 scope).
 
 ## Supported database targets
 

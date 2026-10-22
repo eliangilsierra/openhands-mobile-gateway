@@ -454,13 +454,19 @@ Single SQLite file `/data/gateway.db` on the named volume `gateway-state`. WAL m
 
 | Entity | Fields (type) | Owner | Classification | Retention |
 | --- | --- | --- | --- | --- |
-| `chat_state` | `channel TEXT`, `external_chat_id TEXT`, `active_project TEXT NULL`, `created_at`, `updated_at` — PK `(channel, external_chat_id)` | Store | personal (a Telegram chat ID is a pseudonymous identifier) | until the owner deletes it; `/forget` is out of V1 scope |
-| `conversation_binding` | `id INTEGER PK`, `channel`, `external_chat_id`, `project_key`, `working_dir`, `conversation_id TEXT UNIQUE`, `state TEXT CHECK(state IN ('active','stale','closed'))`, `created_at`, `last_used_at` — UNIQUE `(channel, external_chat_id, project_key)` WHERE `state='active'` | Store | internal | kept indefinitely (FR-8/AC-10 multi-day continuity) |
-| `event_cursor` | `conversation_id TEXT PK`, `last_event_id TEXT`, `last_event_timestamp TEXT`, `updated_at` | Store | internal | with the binding |
-| `seen_event` | `conversation_id TEXT`, `event_id TEXT`, `seen_at` — PK `(conversation_id, event_id)` | Store | internal | pruned to the most recent `SEEN_EVENT_KEEP` (default 2000) rows per conversation, or 7 days, whichever is larger |
-| `pending_confirmation` | `id INTEGER PK`, `conversation_id`, `action_event_id`, `channel`, `external_chat_id`, `channel_message_id`, `created_at`, `resolved_at NULL`, `decision NULL` | Store | internal | deleted 7 days after `resolved_at` |
+| `chat_state` | `channel TEXT`, `external_chat_id TEXT`, `active_project TEXT NULL`, `created_at`, `updated_at` — PK `(channel, external_chat_id)` | Store | personal (a Telegram chat ID is a pseudonymous identifier) | until the owner deletes it (`ChatStateRepository.eraseChat` erases a chat completely; no `/forget` command in V1) |
+| `conversation_binding` | `id INTEGER PK`, `channel`, `external_chat_id`, `project_key`, `working_dir`, `conversation_id TEXT UNIQUE`, `state TEXT CHECK(state IN ('active','stale','closed'))`, `created_at`, `last_used_at` — UNIQUE `(channel, external_chat_id, project_key)` WHERE `state='active'` | Store | internal | `active` bindings are kept indefinitely (FR-8/AC-10 multi-day continuity); `closed`/`stale` bindings are deleted `RETENTION_DAYS` (default 30) after `last_used_at`, unless an unresolved `pending_confirmation` exists |
+| `event_cursor` | `conversation_id TEXT PK`, `last_event_id TEXT`, `last_event_timestamp TEXT`, `updated_at` | Store | internal | deleted in the same transaction as the binding is pruned |
+| `seen_event` | `conversation_id TEXT`, `event_id TEXT`, `seen_at` — PK `(conversation_id, event_id)` | Store | internal | pruned to the most recent `SEEN_EVENT_KEEP` (default 2000) rows per conversation, or 7 days, whichever is larger; also deleted with its pruned binding |
+| `pending_confirmation` | `id INTEGER PK`, `conversation_id`, `action_event_id`, `channel`, `external_chat_id`, `channel_message_id`, `created_at`, `resolved_at NULL`, `decision NULL` | Store | internal | an unanswered prompt expires (`decision='expired'`) `RETENTION_DAYS` after `created_at`; deleted 7 days after `resolved_at` |
 | `schema_migration` | `version INTEGER PK`, `applied_at` | Store | internal | forever |
 
+- **Retention schedule:** the Gateway runs one retention pass at startup and then hourly, stopped on
+  shutdown. In order: expire unanswered confirmations, delete inactive bindings together with their
+  `event_cursor` and `seen_event` rows (one transaction; never an `active` binding or one with an
+  unresolved confirmation), delete confirmations resolved more than 7 days ago, prune `seen_event`
+  per conversation. `RETENTION_DAYS` (1-3650, default 30) sets the age. A failing pass is logged
+  (`retention.failed`) and retried at the next tick.
 - **No secret is ever stored.** `TELEGRAM_BOT_TOKEN` and `OPENHANDS_API_KEY` live only in process
   memory, read from the environment.
 - **No message content is stored.** Conversation history is OpenHands' job (G-2); the Gateway stores

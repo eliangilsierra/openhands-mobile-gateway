@@ -33,6 +33,7 @@ describe("loadConfig", () => {
       eventPollSeconds: 5,
       wsIdleSeconds: 900,
       maxTaskChars: 8000,
+      retentionDays: 30,
     });
   });
 
@@ -205,8 +206,11 @@ describe("event and task settings", () => {
       EVENT_POLL_SECONDS: "300",
       WS_IDLE_SECONDS: "1",
       MAX_TASK_CHARS: "32000",
+      RETENTION_DAYS: "3650",
     });
 
+    expect(config.retentionDays).toBe(3650);
+    expect(loadConfig({ ...VALID_ENV, RETENTION_DAYS: "1" }).retentionDays).toBe(1);
     expect(config.eventPollSeconds).toBe(300);
     expect(config.wsIdleSeconds).toBe(1);
     expect(config.maxTaskChars).toBe(32000);
@@ -223,6 +227,12 @@ describe("event and task settings", () => {
     ["MAX_TASK_CHARS", "32001"],
     ["MAX_TASK_CHARS", ""],
     ["MAX_TASK_CHARS", "-5"],
+    ["RETENTION_DAYS", "0"],
+    ["RETENTION_DAYS", "3651"],
+    ["RETENTION_DAYS", "1.5"],
+    ["RETENTION_DAYS", "abc"],
+    ["RETENTION_DAYS", ""],
+    ["RETENTION_DAYS", "-1"],
   ])("rejects %s=%j", (key, value) => {
     expect(() => loadConfig({ ...VALID_ENV, [key]: value })).toThrow(ConfigError);
   });
