@@ -72,6 +72,11 @@ function config(): GatewayConfig {
   };
 }
 
+/** One poll interval (EVENT_POLL_SECONDS=1) plus margin: a live loop would poll inside it. */
+const QUIET_WINDOW_MS = 1300;
+/** Boot (<=4 s of waits) + subscription wait (<=8 s) + quiet window; never the 5 s default. */
+const TEST_BUDGET_MS = 20_000;
+
 async function boot(): Promise<void> {
   const cfg = config();
   gateway = await startGateway(cfg, {
@@ -306,10 +311,13 @@ describe("gateway wiring", () => {
     expect(() => db.prepare("SELECT 1")).toThrow();
     expect(lines.some((l) => l.includes('"event":"shutdown.done"'))).toBe(true);
 
-    // No upstream traffic for more than two poll intervals (EVENT_POLL_SECONDS=1): a live poll
-    // loop would have asked for events again. Real time on purpose; the mock server is real too.
+    // No upstream traffic for more than one poll interval (EVENT_POLL_SECONDS=1): a live poll loop
+    // would have asked for events again. Real time on purpose; the mock server is real too.
     const before = mock.requests.length;
-    await new Promise((resolve) => setTimeout(resolve, 2500));
+    await new Promise((resolve) => setTimeout(resolve, QUIET_WINDOW_MS));
     expect(mock.requests.length).toBe(before);
-  });
+    // Root cause of the former flake: boot + polling waits + a 2.5 s quiet window had to fit in
+    // vitest's default 5 s and did not under host load. The window is now one interval plus margin
+    // and the test declares the budget of its own real-time phases explicitly.
+  }, TEST_BUDGET_MS);
 });

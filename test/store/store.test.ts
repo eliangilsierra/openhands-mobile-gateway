@@ -399,6 +399,30 @@ describe("retention (issue #27)", () => {
     expect(repo.findByConversationId("c-new")).not.toBeNull();
   });
 
+  it("#44: expireUnresolved keeps a prompt exactly maxAgeMs old (strict <)", () => {
+    const pending = new PendingConfirmationRepository(db, logger, () => base);
+    const make = (conversationId: string, ageMs: number) => {
+      const row = pending.create({
+        conversationId,
+        actionEventId: "a1",
+        channel: "telegram",
+        externalChatId: "1",
+        channelMessageId: "m1",
+      });
+      db.prepare("UPDATE pending_confirmation SET created_at = ? WHERE id = ?").run(
+        new Date(base.getTime() - ageMs).toISOString(),
+        row.id,
+      );
+      return row;
+    };
+    const exact = make("c-exact", 30 * DAY);
+    const older = make("c-older", 30 * DAY + 1);
+
+    expect(pending.expireUnresolved(30 * DAY)).toBe(1);
+    expect(pending.findById(exact.id)?.resolvedAt).toBeNull();
+    expect(pending.findById(older.id)?.decision).toBe("expired");
+  });
+
   it("#44: seen_event pruneAll prunes every conversation", () => {
     const seen = new SeenEventRepository(db, logger);
     const old = new Date(base.getTime() - 30 * DAY).toISOString();
