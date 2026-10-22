@@ -25,11 +25,26 @@ export const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024;
 export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 /** SR-2: events waiting for the consumer before the socket is dropped and replayed from the cursor. */
 export const DEFAULT_MAX_QUEUE = 1000;
+/** N1: serialised bytes waiting for the consumer; a few large events must not exhaust memory either. */
+export const DEFAULT_MAX_QUEUE_BYTES = 8 * 1024 * 1024;
+/** N3: how far ahead of the local clock an event timestamp may be before the event is rejected. */
+export const DEFAULT_MAX_FUTURE_SKEW_MS = 10 * 60 * 1000;
+/** N4: hand-off attempts after which an event that always fails is parked (skipped) so the stream moves on. */
+export const DEFAULT_MAX_HANDOFF_ATTEMPTS = 5;
+/** CR-8: how long a new consumer waits for the previous (possibly hung) one before it starts anyway. */
+export const DEFAULT_PREVIOUS_CONSUMER_WAIT_MS = 30_000;
 /** SR-3: a socket that stays open this long counts as healthy and resets the backoff. */
 export const DEFAULT_STABLE_MS = 30_000;
 /** CR-3: page size and page limit of one REST fallback poll. */
 const POLL_PAGE_LIMIT = 100;
 const POLL_MAX_PAGES = 20;
+/**
+ * CR-6: the REST fallback sends only parameters of the OpenHands agent-server v1.24.0
+ * `GET /api/conversations/{id}/events/search` contract (`page_id`, `limit` 1..100, `kind`, `source`,
+ * `body`, `sort_order` in {TIMESTAMP, TIMESTAMP_DESC}, `timestamp__gte`, `timestamp__lt`).
+ * `TIMESTAMP` is also the server default (oldest first).
+ */
+const POLL_SORT_ORDER = "TIMESTAMP";
 const MAX_KIND_LENGTH = 64;
 const MAX_TIMESTAMP_LENGTH = 64;
 const EVENT_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -106,6 +121,16 @@ export interface EventSubscriberOptions {
   readonly maxQueue?: number;
   /** SR-3: how long a socket must stay open to reset the backoff (default 30 s). */
   readonly stableMs?: number;
+  /** N1: serialised size of the queued events before the socket is dropped (default 8 MiB). */
+  readonly maxQueueBytes?: number;
+  /** N3: tolerated clock skew for event timestamps in the future (default 10 min). */
+  readonly maxFutureSkewMs?: number;
+  /** N4: hand-off attempts before an event that always fails is parked (default 5). */
+  readonly maxHandoffAttempts?: number;
+  /** CR-8: wait for a previous consumer of the same conversation before starting anyway (default 30 s). */
+  readonly previousConsumerWaitMs?: number;
+  /** Clock, injectable for tests (default `Date.now`). */
+  readonly now?: () => number;
   readonly createSocket?: (url: string) => EventSocket;
   readonly random?: () => number;
 }
@@ -130,7 +155,7 @@ export function backoffDelayMs(attempt: number, random: () => number): number {
   return Math.floor(random() * ceiling);
 }
 
-function parseEvent(value: unknown): OpenHandsEvent | null {
+function parseEvent(value: unknown, latestAllowedMs: number): OpenHandsEvent | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return null;
   }
@@ -143,6 +168,8 @@ function parseEvent(value: unknown): OpenHandsEvent | null {
     timestamp.length > MAX_TIMESTAMP_LENGTH ||
     !TIMESTAMP_PATTERN.test(timestamp) ||
     !Number.isFinite(Date.parse(timestamp)) ||
+    // N3: a far-future timestamp would pin the replay cursor ahead of every real event.
+    Date.parse(timestamp) > latestAllowedMs ||
     typeof kind !== "string" ||
     kind.length > MAX_KIND_LENGTH
   ) {
@@ -183,10 +210,20 @@ function toSocketBase(baseUrl: string): string {
   return `${protocol}//${url.host}${url.pathname.replace(/\/+$/, "")}`;
 }
 
+interface QueuedEvent {
+  readonly event: OpenHandsEvent;
+  readonly bytes: number;
+}
+
 interface Subscription {
   readonly id: string;
   readonly onEvent: EventHandler;
-  readonly queue: OpenHandsEvent[];
+  readonly queue: QueuedEvent[];
+  queueBytes: number;
+  /** CR-8: ids queued or being handed off; a poll must not queue them again. */
+  readonly pending: Set<string>;
+  /** N4: failed hand-off attempts per event id. */
+  readonly failures: Map<string, number>;
   draining: boolean;
   stopped: boolean;
   terminal: boolean;
@@ -217,6 +254,11 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
   const handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
   const maxQueue = options.maxQueue ?? DEFAULT_MAX_QUEUE;
   const stableMs = options.stableMs ?? DEFAULT_STABLE_MS;
+  const maxQueueBytes = options.maxQueueBytes ?? DEFAULT_MAX_QUEUE_BYTES;
+  const maxFutureSkewMs = options.maxFutureSkewMs ?? DEFAULT_MAX_FUTURE_SKEW_MS;
+  const maxHandoffAttempts = options.maxHandoffAttempts ?? DEFAULT_MAX_HANDOFF_ATTEMPTS;
+  const previousConsumerWaitMs = options.previousConsumerWaitMs ?? DEFAULT_PREVIOUS_CONSUMER_WAIT_MS;
+  const now = options.now ?? Date.now;
   const createSocket =
     options.createSocket ??
     ((url: string): EventSocket =>
@@ -239,6 +281,32 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
     }
   }
 
+  function parse(value: unknown): OpenHandsEvent | null {
+    return parseEvent(value, now() + maxFutureSkewMs);
+  }
+
+  function clearQueue(sub: Subscription): void {
+    sub.queue.length = 0;
+    sub.queueBytes = 0;
+    sub.pending.clear();
+  }
+
+  /** True when `promise` settled (or there is none); false when `ms` passed first. Never rejects. */
+  async function settledOrTimeout(promise: Promise<void> | undefined, ms: number): Promise<boolean> {
+    if (promise === undefined) {
+      return true;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), ms);
+    });
+    try {
+      return await Promise.race([promise.then(() => true, () => true), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   function readCursor(sub: Subscription): string | null {
     return options.cursors.read(sub.id)?.lastEventTimestamp ?? null;
   }
@@ -250,10 +318,18 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
     if (sub.stopped) {
       return true;
     }
-    if (sub.queue.length >= maxQueue) {
+    // CR-8: a poll re-reads what the consumer has not finished yet (the cursor has not moved).
+    if (sub.pending.has(event.id)) {
+      return true;
+    }
+    // N1: the size is the serialised event; one oversized event is still accepted into an empty queue.
+    const bytes = Buffer.byteLength(JSON.stringify(event));
+    if (sub.queue.length >= maxQueue || (sub.queue.length > 0 && sub.queueBytes + bytes > maxQueueBytes)) {
       return false;
     }
-    sub.queue.push(event);
+    sub.queue.push({ event, bytes });
+    sub.queueBytes += bytes;
+    sub.pending.add(event.id);
     if (sub.terminal) {
       armIdleTimer(sub);
     }
@@ -271,13 +347,24 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
     run = (async (): Promise<void> => {
       try {
         // Always yields once, so `run` is assigned before the `finally` below can look at it.
-        await previous;
+        // CR-8: a hung previous consumer must not block this subscription for ever.
+        if (!(await settledOrTimeout(previous, previousConsumerWaitMs))) {
+          logger?.warn("Previous consumer did not finish; starting anyway", {
+            event: "event.previous_consumer_timeout",
+            conversation_id: sub.id,
+          });
+        }
         while (!sub.stopped) {
-          const event = sub.queue.shift();
-          if (event === undefined) {
+          const next = sub.queue.shift();
+          if (next === undefined) {
             break;
           }
-          await deliver(sub, event);
+          sub.queueBytes -= next.bytes;
+          try {
+            await deliver(sub, next.event);
+          } finally {
+            sub.pending.delete(next.event.id);
+          }
         }
       } finally {
         sub.draining = false;
@@ -306,16 +393,14 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
       }
       await sub.onEvent(event);
       // Only after the hand-off: a crash here re-delivers (at-least-once) instead of losing the event.
-      options.transaction(() => {
-        options.seen.markSeen(sub.id, event.id);
-        // CR-1: the cursor never moves backwards, whatever order the events were handed over in.
-        const current = options.cursors.read(sub.id)?.lastEventTimestamp ?? null;
-        if (current === null || Date.parse(event.timestamp) >= Date.parse(current)) {
-          options.cursors.advance(sub.id, event.id, event.timestamp);
-        }
-      });
+      commit(sub, event);
+      sub.failures.delete(event.id);
       if (sub.open) {
         markHealthy(sub);
+      } else if (sub.resumeAfterDrain) {
+        // CR-7: events are still being delivered after an overflow, so the stream is not failing:
+        // the reconnect that follows the drain starts from the base delay.
+        sub.reconnectAttempt = 0;
       }
       logger?.debug("Event delivered", {
         event: "event.received",
@@ -324,18 +409,63 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
         kind: event.kind,
       });
     } catch (error) {
+      const attempts = (sub.failures.get(event.id) ?? 0) + 1;
+      sub.failures.set(event.id, attempts);
+      if (attempts >= maxHandoffAttempts && park(sub, event, attempts)) {
+        return;
+      }
       // Drop what is queued behind it (order!) and replay from the cursor, which has not moved.
       logger?.error("Event hand-off failed; replaying from cursor", {
         event: "event.handoff_failed",
         conversation_id: sub.id,
         event_id: event.id,
+        attempt: attempts,
         err_type: errType(error),
       });
-      sub.queue.length = 0;
+      clearQueue(sub);
       if (!sub.stopped) {
         abandonSocket(sub, 1011);
       }
     }
+  }
+
+  /** Marks the event seen and moves the cursor, atomically. */
+  function commit(sub: Subscription, event: OpenHandsEvent): void {
+    options.transaction(() => {
+      options.seen.markSeen(sub.id, event.id);
+      // CR-1: the cursor never moves backwards, whatever order the events were handed over in.
+      const current = options.cursors.read(sub.id)?.lastEventTimestamp ?? null;
+      if (current === null || Date.parse(event.timestamp) >= Date.parse(current)) {
+        options.cursors.advance(sub.id, event.id, event.timestamp);
+      }
+    });
+  }
+
+  /**
+   * N4: an event whose hand-off failed `maxHandoffAttempts` times is skipped (seen + cursor moved) so
+   * it cannot stall the stream. Only ids and kinds are logged, never the payload.
+   */
+  function park(sub: Subscription, event: OpenHandsEvent, attempts: number): boolean {
+    try {
+      commit(sub, event);
+    } catch (error) {
+      logger?.error("Could not park a poison event", {
+        event: "event.park_failed",
+        conversation_id: sub.id,
+        event_id: event.id,
+        err_type: errType(error),
+      });
+      return false;
+    }
+    sub.failures.delete(event.id);
+    logger?.error("Event parked after repeated hand-off failures", {
+      event: "event.parked",
+      conversation_id: sub.id,
+      event_id: event.id,
+      kind: event.kind,
+      attempt: attempts,
+    });
+    return true;
   }
 
   /** A hand-off succeeded on a live socket, or the socket proved stable: backoff starts over (SR-3). */
@@ -492,7 +622,7 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
     } catch {
       parsed = null;
     }
-    const event = parseEvent(parsed);
+    const event = parse(parsed);
     if (event === null) {
       logger?.warn("Ignoring a frame that is not an event", { event: "event.invalid", conversation_id: sub.id });
       return;
@@ -602,7 +732,7 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
       for (let pages = 0; pages < POLL_MAX_PAGES; pages += 1) {
         const page: EventPage = await options.client.searchEvents(sub.id, {
           ...(cursor === null ? {} : { timestamp__gte: cursor }),
-          sort_order: "TIMESTAMP",
+          sort_order: POLL_SORT_ORDER,
           limit: POLL_PAGE_LIMIT,
           ...(pageId === null ? {} : { page_id: pageId }),
         });
@@ -610,7 +740,7 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
           return;
         }
         for (const item of page.items ?? []) {
-          const event = parseEvent(item);
+          const event = parse(item);
           if (event === null) {
             logger?.warn("Ignoring an item that is not an event", {
               event: "event.invalid",
@@ -667,7 +797,7 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
 
   function stop(sub: Subscription): void {
     sub.stopped = true;
-    sub.queue.length = 0;
+    clearQueue(sub);
     clearIdleTimer(sub);
     clearStableTimer(sub);
     stopPolling(sub);
@@ -703,6 +833,9 @@ export function createEventSubscriber(options: EventSubscriberOptions): EventSub
         id: conversationId,
         onEvent,
         queue: [],
+        queueBytes: 0,
+        pending: new Set(),
+        failures: new Map(),
         draining: false,
         stopped: false,
         terminal: false,
