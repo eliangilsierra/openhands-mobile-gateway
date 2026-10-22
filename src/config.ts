@@ -27,7 +27,18 @@ export interface GatewayConfig {
   /** Max age in seconds of the cached OpenHands probe behind `/health` (0 disables the cache). */
   readonly healthCacheSeconds: number;
   readonly timezone: string;
+  /** REST catch-up poll interval of the event subscriber, in seconds. */
+  readonly eventPollSeconds: number;
+  /** How long a terminal conversation keeps its event socket open, in seconds. */
+  readonly wsIdleSeconds: number;
+  /** Largest accepted task text, in characters. */
+  readonly maxTaskChars: number;
 }
+
+/** Upper bounds keep a typo from disabling polling, idling forever or accepting multi-MB tasks. */
+export const MAX_EVENT_POLL_SECONDS = 300;
+export const MAX_WS_IDLE_SECONDS = 86_400;
+export const MAX_TASK_CHARS_LIMIT = 32_000;
 
 /** Raised when the environment fails validation. Never carries a raw secret value. */
 export class ConfigError extends Error {
@@ -122,6 +133,23 @@ const healthCacheSeconds = z
   .transform((value) => Number(value))
   .pipe(z.number().finite("HEALTH_CACHE_SECONDS must be a non-negative number"));
 
+function boundedInteger(name: string, fallback: string, min: number, max: number) {
+  return z
+    .string()
+    .trim()
+    .optional()
+    .default(fallback)
+    .refine((value) => /^\d+$/.test(value), `${name} must be an integer between ${String(min)} and ${String(max)}`)
+    .transform((value) => Number.parseInt(value, 10))
+    .pipe(
+      z
+        .number()
+        .int()
+        .min(min, `${name} must be an integer between ${String(min)} and ${String(max)}`)
+        .max(max, `${name} must be an integer between ${String(min)} and ${String(max)}`),
+    );
+}
+
 const logLevel = z
   .string()
   .optional()
@@ -144,6 +172,9 @@ const EnvSchema = z.object({
   HEALTH_HOST: healthHost,
   HEALTH_CACHE_SECONDS: healthCacheSeconds,
   TZ: requiredNonEmpty("TZ").default("UTC"),
+  EVENT_POLL_SECONDS: boundedInteger("EVENT_POLL_SECONDS", "5", 1, MAX_EVENT_POLL_SECONDS),
+  WS_IDLE_SECONDS: boundedInteger("WS_IDLE_SECONDS", "900", 1, MAX_WS_IDLE_SECONDS),
+  MAX_TASK_CHARS: boundedInteger("MAX_TASK_CHARS", "8000", 1, MAX_TASK_CHARS_LIMIT),
 });
 
 /** The environment variable names `config.ts` reads. Kept in sync with `.env.example`. */
@@ -160,6 +191,9 @@ export const CONFIG_ENV_KEYS = [
   "HEALTH_HOST",
   "HEALTH_CACHE_SECONDS",
   "TZ",
+  "EVENT_POLL_SECONDS",
+  "WS_IDLE_SECONDS",
+  "MAX_TASK_CHARS",
 ] as const;
 
 /** Secret values the logger's redaction hook must never emit (architecture §9.2). */
@@ -214,5 +248,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     healthHost: parsed.HEALTH_HOST,
     healthCacheSeconds: parsed.HEALTH_CACHE_SECONDS,
     timezone: parsed.TZ,
+    eventPollSeconds: parsed.EVENT_POLL_SECONDS,
+    wsIdleSeconds: parsed.WS_IDLE_SECONDS,
+    maxTaskChars: parsed.MAX_TASK_CHARS,
   };
 }
