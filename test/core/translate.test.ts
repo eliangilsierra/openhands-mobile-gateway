@@ -378,11 +378,15 @@ describe("purity (no clock, randomness or I/O)", () => {
     for (const spy of [...spies, fetchSpy, log, err, out]) expect(spy).not.toHaveBeenCalled();
   });
 
-  it("the module has no imports, so it cannot reach fs, net or the clock through a dependency", async () => {
+  it("the only import is the pure sibling redact module; neither reaches fs, net or the clock", async () => {
     const { default: fs } = await import("node:fs");
     const source = fs.readFileSync(new URL("../../src/core/translate.ts", import.meta.url), "utf8");
-    expect(source).not.toMatch(/^\s*import\s/m);
-    expect(source).not.toMatch(/\brequire\(|\bimport\(|process\.|globalThis\.|new Date|Date\.now|Math\.random/);
+    const redact = fs.readFileSync(new URL("../../src/core/redact.ts", import.meta.url), "utf8");
+    expect(source.match(/^import\s.*$/gm)).toEqual(['import { redactDetail } from "./redact.js";']);
+    expect(redact).not.toMatch(/^\s*import\s/m);
+    for (const text of [source, redact]) {
+      expect(text).not.toMatch(/\brequire\(|\bimport\(|process\.|globalThis\.|new Date|Date\.now|Math\.random/);
+    }
   });
 
   it("same input gives deep-equal output and the input is not mutated (deep-frozen)", () => {
@@ -716,7 +720,7 @@ describe("final review round (N1, N2, N4, P11, CR-10)", () => {
 
   it("requires a host after the '@' (a trailing or punctuation-only '@' is not userinfo)", () => {
     const scheme = "https" + "://";
-    for (const text of [`${scheme}svc:pw@`, `${scheme}svc:pw@ rest`, `${scheme}svc:pw@.x`, `${scheme}svc:pw@-x`, `${scheme}svc:pw@/x`]) {
+    for (const text of [`${scheme}svc:pw@`, `${scheme}svc:pw@ rest`, `${scheme}svc:pw@.`, `${scheme}svc:pw@-`, `${scheme}svc:pw@/x`, `${scheme}svc:pw@%`]) {
       expect(sanitizeDetail(text)).toBe(text);
     }
     expect(sanitizeDetail(`${scheme}svc:pw@host`)).toBe(`${scheme}[redacted]host`);

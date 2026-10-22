@@ -50,3 +50,14 @@ request.
 affected.
 
 See also: [ADR-0007](docs/decisions/ADR-0007-agentcanvas-auth-trust-boundary.md).
+
+## Redaction of error details: accepted limitations
+
+Error details shown to users go through `src/core/redact.ts`. It redacts URL userinfo, keyword
+assignments, bearer and JWT tokens, cookies and `curl -u`, also when hidden by invisible characters,
+combining marks, JSON escapes or percent-encoding. These cases are known and accepted:
+
+- A space or a quote in a URL password ends the URL token, so the part after it is not read as userinfo.
+- A password of 1 to 5 digits (value up to 65535) followed by `/`, `?` or `#` is read as a port.
+- A password that holds `@` followed by a later `/`, `?` or `#` is cut at the last `@` before that delimiter.
+- Text that is encoded twice (for example `%2540`) is decoded once only.
