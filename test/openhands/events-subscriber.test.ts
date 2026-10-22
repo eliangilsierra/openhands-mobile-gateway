@@ -24,11 +24,47 @@ import { createRecordingLogger, createTempDbPath, type RecordingLogger } from ".
 const CONV = "11111111-2222-3333-4444-555555555555";
 const KEY = "test-key-do-not-log-0123456789";
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+/** The fixtures use October 2026 timestamps; a fixed clock keeps the future-timestamp check (N3) deterministic. */
+const FIXED_NOW = Date.parse("2026-10-12T00:00:00.000Z");
+
+/**
+ * CR-6 contract fixture: query parameters of OpenHands agent-server v1.24.0
+ * `GET /api/conversations/{id}/events/search` (software-agent-sdk, `event_router.py`
+ * `search_conversation_events`; `EventSortOrder` in `models.py`). The mock answers 422 for anything the
+ * real server would reject, so a wrong parameter makes the poll deliver nothing and the test fail.
+ */
+const EVENTS_SEARCH_CONTRACT = {
+  params: ["page_id", "limit", "kind", "source", "body", "sort_order", "timestamp__gte", "timestamp__lt"],
+  sortOrders: ["TIMESTAMP", "TIMESTAMP_DESC"],
+  limit: { min: 1, max: 100 },
+} as const;
+
+function contractViolations(params: URLSearchParams): string[] {
+  const problems: string[] = [];
+  for (const [name, value] of params) {
+    if (!(EVENTS_SEARCH_CONTRACT.params as readonly string[]).includes(name)) {
+      problems.push(`unknown parameter ${name}`);
+    }
+    if (name === "sort_order" && !(EVENTS_SEARCH_CONTRACT.sortOrders as readonly string[]).includes(value)) {
+      problems.push(`invalid sort_order ${value}`);
+    }
+    if (name === "limit") {
+      const n = Number(value);
+      if (!Number.isInteger(n) || n < EVENTS_SEARCH_CONTRACT.limit.min || n > EVENTS_SEARCH_CONTRACT.limit.max) {
+        problems.push(`invalid limit ${value}`);
+      }
+    }
+    if ((name === "timestamp__gte" || name === "timestamp__lt") && !Number.isFinite(Date.parse(value))) {
+      problems.push(`invalid ${name} ${value}`);
+    }
+  }
+  return problems;
+}
 
 function ev(n: number, extra: Record<string, unknown> = {}): OpenHandsEvent {
   return {
     id: `e${n}`,
-    timestamp: `2026-10-11T10:00:0${n}.000Z`,
+    timestamp: `2026-10-11T10:00:${String(n).padStart(2, "0")}.000Z`,
     kind: "MessageEvent",
     source: "agent",
     ...extra,
@@ -58,6 +94,8 @@ interface MockServer {
   readonly baseUrl: string;
   readonly conns: Conn[];
   readonly searches: URLSearchParams[];
+  /** Searches the contract fixture rejected (answered 422). */
+  readonly rejectedSearches: string[];
   searchItems: OpenHandsEvent[];
   refuseWs: boolean;
   /** Accepts the TCP connection of an upgrade and never answers it. */
@@ -73,6 +111,7 @@ async function startServer(): Promise<MockServer> {
     baseUrl: "",
     conns: [],
     searches: [],
+    rejectedSearches: [],
     searchItems: [],
     refuseWs: false,
     hangWs: false,
@@ -84,6 +123,13 @@ async function startServer(): Promise<MockServer> {
     const url = new URL(req.url ?? "/", "http://x");
     if (/\/events\/search$/.test(url.pathname)) {
       state.searches.push(url.searchParams);
+      const violations = contractViolations(url.searchParams);
+      if (violations.length > 0) {
+        state.rejectedSearches.push(...violations);
+        res.writeHead(422, { "content-type": "application/json" });
+        res.end(JSON.stringify({ detail: violations }));
+        return;
+      }
       if (state.searchResponder !== null) {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(state.searchResponder(url.searchParams)));
@@ -231,6 +277,7 @@ function make(
     client: createOpenHandsRestClient({ baseUrl: server.baseUrl, apiKey: KEY }),
     logger,
     random: () => 0.002,
+    now: () => FIXED_NOW,
     eventPollSeconds: 0.02,
     onHealthSignal: (s) => signals.push(s),
     onAuthFailed: (id) => authFailed.push(id),
@@ -997,5 +1044,219 @@ describe("CR-5: no duplicate pollers or consumers", () => {
     expect(maxActive).toBe(1);
     // The old consumer finished e1 first, so the replay of e1 is a duplicate for the new one.
     expect(seenBy).toEqual(["old:e1"]);
+  });
+});
+
+describe("CR-6: REST fallback sticks to the events/search contract", () => {
+  it("the contract fixture rejects parameters the server would reject", () => {
+    expect(contractViolations(new URLSearchParams("sort_order=ASC"))).toHaveLength(1);
+    expect(contractViolations(new URLSearchParams("sort_order=TIMESTAMP&limit=101"))).toHaveLength(1);
+    expect(contractViolations(new URLSearchParams("order=asc"))).toHaveLength(1);
+    const valid = "sort_order=TIMESTAMP_DESC&limit=100&page_id=x&timestamp__gte=2026-10-11T10:00:01.000Z";
+    expect(contractViolations(new URLSearchParams(valid))).toEqual([]);
+  });
+
+  it("polls with validated parameters only (first page and following pages) and delivers", async () => {
+    server.refuseWs = true;
+    server.searchResponder = (params) =>
+      params.get("page_id") === "p2"
+        ? { items: [ev(2)], next_page_id: null }
+        : { items: [ev(1)], next_page_id: "p2" };
+    const received: OpenHandsEvent[] = [];
+    const { sub } = make();
+    sub.subscribe(CONV, (e) => {
+      received.push(e);
+    });
+    await vi.waitFor(() => expect(ids(received)).toEqual(["e1", "e2"]));
+    // A later poll carries the cursor as timestamp__gte.
+    await vi.waitFor(() => expect(server.searches.some((s) => s.has("timestamp__gte"))).toBe(true));
+    expect(server.rejectedSearches).toEqual([]);
+    const names = new Set(server.searches.flatMap((s) => [...s.keys()]));
+    expect([...names].sort()).toEqual(["limit", "page_id", "sort_order", "timestamp__gte"]);
+  });
+});
+
+describe("CR-7: backoff after a queue overflow", () => {
+  it("does not keep growing while events are delivered between overflows", async () => {
+    const { sockets, createSocket } = fakeSockets();
+    const received: string[] = [];
+    const { sub } = make({ createSocket, maxQueue: 3, random: () => 0.0099 });
+    sub.subscribe(CONV, (e) => {
+      received.push(e.id);
+    });
+    for (let round = 0; round < 3; round += 1) {
+      await vi.waitFor(() => expect(sockets).toHaveLength(round + 1));
+      const socket = sockets[round];
+      socket?.emit("open");
+      // Fresh ids every round: three are queued and delivered, the fourth overflows.
+      [1, 2, 3, 4].forEach((n) => socket?.frame(ev(round * 3 + n)));
+      await vi.waitFor(() => expect(received).toHaveLength((round + 1) * 3));
+    }
+    await vi.waitFor(() => expect(sockets).toHaveLength(4));
+    expect(delaysOf().slice(0, 3)).toEqual([9, 9, 9]);
+  });
+});
+
+describe("CR-8: polls and hung consumers", () => {
+  it("a poll does not queue events that are still pending", async () => {
+    server.refuseWs = true;
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let calls = 0;
+    let released = false;
+    const client = {
+      searchEvents: async () => {
+        calls += 1;
+        // The server keeps returning the page until the consumer has moved the cursor past it.
+        return { items: released ? [] : [ev(1), ev(2), ev(3)], next_page_id: null };
+      },
+    };
+    const received: string[] = [];
+    const { sub } = make({ client, wsFailThreshold: 1, maxQueue: 3 });
+    sub.subscribe(CONV, async (e) => {
+      if (e.id === "e1") await gate;
+      received.push(e.id);
+    });
+    // The consumer is stuck on e1 while several polls re-read the same page.
+    await vi.waitFor(() => expect(calls).toBeGreaterThanOrEqual(4));
+    released = true;
+    release();
+    await vi.waitFor(() => expect(received).toEqual(["e1", "e2", "e3"]));
+    await new Promise((r) => setTimeout(r, 60));
+    expect(logger.records.filter((r) => r.fields?.event === "event.deduped")).toHaveLength(0);
+    expect(logger.records.filter((r) => r.fields?.event === "ws.queue_full")).toHaveLength(0);
+    expect(received).toEqual(["e1", "e2", "e3"]);
+  });
+
+  it("a hung consumer does not block a re-subscription", async () => {
+    server.onConnection = (conn, i) => {
+      if (i < 2) conn.send(ev(1));
+    };
+    const received: string[] = [];
+    const { sub } = make({ previousConsumerWaitMs: 40 });
+    sub.subscribe(CONV, () => new Promise<void>(() => undefined));
+    await vi.waitFor(() => expect(server.conns).toHaveLength(1));
+    await new Promise((r) => setTimeout(r, 20));
+    sub.unsubscribe(CONV);
+    sub.subscribe(CONV, (e) => {
+      received.push(e.id);
+    });
+    await vi.waitFor(() => expect(received).toEqual(["e1"]));
+    expect(logger.records.some((r) => r.fields?.event === "event.previous_consumer_timeout")).toBe(true);
+  });
+});
+
+describe("N1: the queue is bounded by bytes", () => {
+  it("drops the socket when the queued events exceed maxQueueBytes, before the count limit", async () => {
+    const { sockets, createSocket } = fakeSockets();
+    const received: string[] = [];
+    const { sub } = make({ createSocket, maxQueueBytes: 3000 });
+    sub.subscribe(CONV, (e) => {
+      received.push(e.id);
+    });
+    const socket = sockets[0];
+    socket?.emit("open");
+    const big = "x".repeat(1000);
+    [1, 2, 3, 4].forEach((n) => socket?.frame(ev(n, { content: big })));
+    expect(logger.records.some((r) => r.fields?.event === "ws.queue_full")).toBe(true);
+    expect(socket?.closes).toEqual([1013]);
+    await vi.waitFor(() => expect(received).toEqual(["e1", "e2"]));
+  });
+
+  it("accepts a single event larger than the byte limit into an empty queue", async () => {
+    const { sockets, createSocket } = fakeSockets();
+    const received: string[] = [];
+    const { sub } = make({ createSocket, maxQueueBytes: 100 });
+    sub.subscribe(CONV, (e) => {
+      received.push(e.id);
+    });
+    sockets[0]?.emit("open");
+    sockets[0]?.frame(ev(1, { content: "y".repeat(500) }));
+    await vi.waitFor(() => expect(received).toEqual(["e1"]));
+  });
+});
+
+describe("N3: far-future timestamps", () => {
+  it("rejects them on the socket so they cannot pin the replay cursor", async () => {
+    const { sockets, createSocket } = fakeSockets();
+    const received: string[] = [];
+    const { sub } = make({ createSocket });
+    sub.subscribe(CONV, (e) => {
+      received.push(e.id);
+    });
+    sockets[0]?.emit("open");
+    sockets[0]?.frame(ev(9, { timestamp: "2099-01-01T00:00:00.000Z" }));
+    sockets[0]?.frame(ev(1));
+    await vi.waitFor(() => expect(received).toEqual(["e1"]));
+    expect(cursors.read(CONV)?.lastEventTimestamp).toBe(ev(1).timestamp);
+    expect(logger.records.filter((r) => r.fields?.event === "event.invalid")).toHaveLength(1);
+  });
+
+  it("rejects far-future items from events/search", async () => {
+    server.refuseWs = true;
+    server.searchResponder = () => ({
+      items: [ev(9, { timestamp: "2099-01-01T00:00:00.000Z" }), ev(1)],
+      next_page_id: null,
+    });
+    const received: string[] = [];
+    const { sub } = make();
+    sub.subscribe(CONV, (e) => {
+      received.push(e.id);
+    });
+    await vi.waitFor(() => expect(received).toEqual(["e1"]));
+    expect(cursors.read(CONV)?.lastEventId).toBe("e1");
+  });
+
+  it("tolerates small clock skew", async () => {
+    const { sockets, createSocket } = fakeSockets();
+    const received: string[] = [];
+    const { sub } = make({ createSocket, now: () => Date.parse(ev(1).timestamp) - 60_000 });
+    sub.subscribe(CONV, (e) => {
+      received.push(e.id);
+    });
+    sockets[0]?.emit("open");
+    sockets[0]?.frame(ev(1));
+    await vi.waitFor(() => expect(received).toEqual(["e1"]));
+  });
+});
+
+describe("N4: poison events are parked", () => {
+  it("skips an event after maxHandoffAttempts, logs no payload, and the stream moves on", async () => {
+    server.onConnection = (conn) => {
+      conn.send(ev(1, { content: "POISON-PAYLOAD" }));
+      conn.send(ev(2));
+    };
+    const received: string[] = [];
+    const { sub } = make({ maxHandoffAttempts: 3 });
+    sub.subscribe(CONV, (e) => {
+      if (e.id === "e1") throw new Error("cannot handle");
+      received.push(e.id);
+    });
+    await vi.waitFor(() => expect(received).toContain("e2"));
+    const parked = logger.records.filter((r) => r.fields?.event === "event.parked");
+    expect(parked).toHaveLength(1);
+    expect(parked[0]?.fields).toMatchObject({ event_id: "e1", attempt: 3 });
+    expect(JSON.stringify(logger.records)).not.toContain("POISON-PAYLOAD");
+    expect(seen.hasSeen(CONV, "e1")).toBe(true);
+    expect(cursors.read(CONV)?.lastEventId).toBe("e2");
+    expect(logger.records.filter((r) => r.fields?.event === "event.handoff_failed")).toHaveLength(2);
+  });
+
+  it("keeps replaying an event that fails fewer times than the limit", async () => {
+    server.onConnection = (conn) => conn.send(ev(1));
+    let failures = 0;
+    const received: string[] = [];
+    const { sub } = make({ maxHandoffAttempts: 5 });
+    sub.subscribe(CONV, (e) => {
+      if (failures < 2) {
+        failures += 1;
+        throw new Error("transient");
+      }
+      received.push(e.id);
+    });
+    await vi.waitFor(() => expect(received).toEqual(["e1"]));
+    expect(logger.records.some((r) => r.fields?.event === "event.parked")).toBe(false);
   });
 });
